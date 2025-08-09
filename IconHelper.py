@@ -1,37 +1,59 @@
 #!/usr/bin/env python3
+
 import os
 import json
 import subprocess
 import threading
 import time
 import shutil
-# stop pointless version nagging
+from typing import Callable, Dict, List, Optional
+
 import gi
 gi.require_version('Gtk', '3.0')
-
 from gi.repository import Gtk, GdkPixbuf, GLib
 
-
-# Main variables
+# --------------------------------------------------------------------------
+# Globals and Constants
+# --------------------------------------------------------------------------
 
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+
 PLACEHOLDER_PATH = os.path.join(SCRIPT_DIR, "emblem-unreadable.png")
 SYMLINK_EMBLEM_PATH = os.path.join(SCRIPT_DIR, "emblem-symlink.png")
 TEMPLATE_SVG = os.path.join(SCRIPT_DIR, "template.svg")
 BITMAP_SIZES = [16, 22, 24, 32, 48]
+CATEGORIES_FILE = os.path.join(SCRIPT_DIR, "icon_categories.json")
+PNG_EMBLEM = os.path.join(SCRIPT_DIR, "emblem-png.png")
+
+
+# --------------------------------------------------------------------------
+# Utility Functions
+# --------------------------------------------------------------------------
+
+def check_file_exists(path: str) -> bool:
+    """Utility to check if a file exists and show an error if not."""
+    if not os.path.isfile(path):
+        print(f"Required file missing: {path}")
+        return False
+    return True
+
+
+# --------------------------------------------------------------------------
+# LazyIconBox Widget
+# --------------------------------------------------------------------------
 
 class LazyIconBox(Gtk.EventBox):
-    def __init__(self, icon_name, icon_path, click_cb):
+    """Widget to display an icon preview with overlays and label."""
+
+    def __init__(self, icon_name: str, icon_path: str, click_cb: Callable):
         super().__init__()
         self.icon_name = icon_name
         self.icon_path = icon_path
         self.click_cb = click_cb
 
-        # Container for image + label vertically
         vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
         self.add(vbox)
 
-        # Overlay to stack icon and emblem
         self.overlay = Gtk.Overlay()
         vbox.pack_start(self.overlay, False, False, 0)
 
@@ -47,70 +69,93 @@ class LazyIconBox(Gtk.EventBox):
 
         self.update_icon(icon_path)
 
-    def update_icon(self, icon_path):
-        if icon_path and icon_path != PLACEHOLDER_PATH:
+    def update_icon(self, icon_path: str):
+        """Update icon preview and overlays."""
+
+        # Load main icon
+        pixbuf = None
+        if icon_path and icon_path != PLACEHOLDER_PATH and check_file_exists(icon_path):
             try:
                 pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_size(icon_path, 64, 64)
-                self.image.set_from_pixbuf(pixbuf)
-                self.icon_path = icon_path
             except Exception as e:
                 print(f"Error loading icon '{icon_path}': {e}")
-                placeholder_pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_size(PLACEHOLDER_PATH, 64, 64)
-                self.image.set_from_pixbuf(placeholder_pixbuf)
-                self.icon_path = PLACEHOLDER_PATH
-        else:
-            placeholder_pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_size(PLACEHOLDER_PATH, 64, 64)
-            self.image.set_from_pixbuf(placeholder_pixbuf)
+
+        if pixbuf is None:
+            pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_size(PLACEHOLDER_PATH, 64, 64)
             self.icon_path = PLACEHOLDER_PATH
 
-        # Remove any existing emblems before adding new ones
-        if hasattr(self, 'emblem'):
-            self.overlay.remove(self.emblem)
-            del self.emblem
-        if hasattr(self, 'png_emblem'):
-            self.overlay.remove(self.png_emblem)
-            del self.png_emblem
+        self.image.set_from_pixbuf(pixbuf)
 
-        # Add symlink emblem overlay if icon_path is symlink and not placeholder
+        # Remove previous overlays
+        for attr in ('emblem', 'png_emblem'):
+            if hasattr(self, attr):
+                self.overlay.remove(getattr(self, attr))
+                delattr(self, attr)
+
+        # Add overlays
         if icon_path != PLACEHOLDER_PATH and os.path.islink(icon_path):
-            emblem_pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_size(SYMLINK_EMBLEM_PATH, 16, 16)
-            self.emblem = Gtk.Image.new_from_pixbuf(emblem_pixbuf)
-            self.emblem.set_halign(Gtk.Align.END)
-            self.emblem.set_valign(Gtk.Align.START)
-            self.overlay.add_overlay(self.emblem)
-            self.emblem.show()
+            if check_file_exists(SYMLINK_EMBLEM_PATH):
+                emblem_pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_size(SYMLINK_EMBLEM_PATH, 16, 16)
+                self.emblem = Gtk.Image.new_from_pixbuf(emblem_pixbuf)
+                self.emblem.set_halign(Gtk.Align.END)
+                self.emblem.set_valign(Gtk.Align.START)
+                self.overlay.add_overlay(self.emblem)
+                self.emblem.show()
 
-        # Add PNG emblem overlay if the icon file is a PNG
         elif icon_path != PLACEHOLDER_PATH and icon_path.lower().endswith('.png'):
-            png_emblem_pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_size('emblem-png.png', 16, 16)
-            self.png_emblem = Gtk.Image.new_from_pixbuf(png_emblem_pixbuf)
-            self.png_emblem.set_halign(Gtk.Align.END)
-            self.png_emblem.set_valign(Gtk.Align.START)
-            self.overlay.add_overlay(self.png_emblem)
-            self.png_emblem.show()
+            if check_file_exists(PNG_EMBLEM):
+                png_emblem_pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_size(PNG_EMBLEM, 16, 16)
+                self.png_emblem = Gtk.Image.new_from_pixbuf(png_emblem_pixbuf)
+                self.png_emblem.set_halign(Gtk.Align.END)
+                self.png_emblem.set_valign(Gtk.Align.START)
+                self.overlay.add_overlay(self.png_emblem)
+                self.png_emblem.show()
 
+
+# --------------------------------------------------------------------------
+# IconThemeHelper Main Window
+# --------------------------------------------------------------------------
 
 class IconThemeHelper(Gtk.Window):
+    """Main application window for icon theme management."""
+
     def __init__(self):
         super().__init__(title="Icon Theme Helper")
-        self.set_default_size(1500, 1000)
+        self.set_default_size(1200, 800)
 
-        with open("icon_categories.json", "r") as f:
-            self.icon_categories = json.load(f)
+        self.icon_categories: Dict[str, List[str]] = {}
+        self.theme_path: Optional[str] = None
+        self.current_category: Optional[str] = None
+        self.icon_index: Dict[str, str] = {}
+        self.icon_boxes: List[LazyIconBox] = []
+        self.indexing_done: bool = False
 
-        self.theme_path = None
-        self.current_category = None
-        self.icon_index = {}  # icon_name -> full_path
-        self.icon_boxes = []  # keep refs to LazyIconBox for updating
-        self.indexing_done = False
+        if not check_file_exists(CATEGORIES_FILE):
+            self.show_message("Error", f"Missing categories file: {CATEGORIES_FILE}")
+            return
+
+        try:
+            with open(CATEGORIES_FILE, "r") as f:
+                self.icon_categories = json.load(f)
+        except Exception as e:
+            self.show_message("Error", f"Cannot load categories: {e}")
+            return
+
+        self.setup_ui()
+
+    def setup_ui(self):
+        """Initialize main UI widgets."""
 
         main_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         self.add(main_box)
 
+        # Sidebar
+        sidebar_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+
         self.category_list = Gtk.ListBox()
         self.category_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
         self.category_list.connect("row-selected", self.on_category_selected)
-        self.category_list.set_sensitive(False)  # disabled until theme selected/indexed
+        self.category_list.set_sensitive(False)
 
         for category in self.icon_categories.keys():
             row = Gtk.ListBoxRow()
@@ -118,20 +163,33 @@ class IconThemeHelper(Gtk.Window):
             row.add(label)
             self.category_list.add(row)
 
-        sidebar_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-
         choose_btn = Gtk.Button(label="Choose Theme Folder")
         choose_btn.connect("clicked", self.on_choose_theme)
 
         refresh_btn = Gtk.Button(label="Refresh Icons")
         refresh_btn.connect("clicked", self.on_refresh_clicked)
         sidebar_box.pack_start(refresh_btn, False, False, 0)
-
         sidebar_box.pack_start(choose_btn, False, False, 0)
         sidebar_box.pack_start(self.category_list, True, True, 0)
 
+        self.symlink_checkbox = Gtk.CheckButton(label="Show Symlinks")
+        self.symlink_checkbox.set_active(False)
+        self.symlink_checkbox.connect("toggled", self.on_symlink_filter_toggled)
+        sidebar_box.pack_start(self.symlink_checkbox, False, False, 0)
+
+        self.toggle_checkbox = Gtk.CheckButton(label="Show Symbolic Icons")
+        self.toggle_checkbox.set_active(False)
+        self.toggle_checkbox.connect("toggled", self.on_symbolic_filter_toggled)
+        sidebar_box.pack_start(self.toggle_checkbox, False, False, 0)
+
+        self.create_symlink_btn = Gtk.Button(label="Create Symlink")
+        self.create_symlink_btn.set_sensitive(False)
+        self.create_symlink_btn.connect("clicked", self.on_create_symlink_clicked)
+        sidebar_box.pack_start(self.create_symlink_btn, False, False, 0)
+
         main_box.pack_start(sidebar_box, False, False, 0)
 
+        # Icon grid
         self.flowbox = Gtk.FlowBox()
         self.flowbox.set_valign(Gtk.Align.START)
         self.flowbox.set_max_children_per_line(10)
@@ -142,24 +200,26 @@ class IconThemeHelper(Gtk.Window):
         main_box.pack_start(scrolled, True, True, 0)
 
         self.show_symlinks = False
-        self.symlink_checkbox = Gtk.CheckButton(label="Show Symlinks")
-        self.symlink_checkbox.set_active(False)  # Default off
-        self.symlink_checkbox.connect("toggled", self.on_symlink_filter_toggled)
-        sidebar_box.pack_start(self.symlink_checkbox, False, False, 0)
-
         self.show_symbolic = False
-        self.toggle_checkbox = Gtk.CheckButton(label="Show Symbolic Icons")
-        self.toggle_checkbox.set_active(False)  # Default off
-        self.toggle_checkbox.connect("toggled", self.on_symbolic_filter_toggled)
-        sidebar_box.pack_start(self.toggle_checkbox, False, False, 0)
-                        
-        self.create_symlink_btn = Gtk.Button(label="Create Symlink")
-        self.create_symlink_btn.set_sensitive(False)  # disabled initially, until theme loaded
-        self.create_symlink_btn.connect("clicked", self.on_create_symlink_clicked)
-        sidebar_box.pack_start(self.create_symlink_btn, False, False, 0)
 
+    # ----------------------------------------------------------------------
+    # Dialogs and Messaging
+    # ----------------------------------------------------------------------
+
+    def show_message(self, title: str, message: str):
+        """Show user a modal message dialog."""
+        md = Gtk.MessageDialog(parent=self, flags=0, message_type=Gtk.MessageType.INFO,
+                               buttons=Gtk.ButtonsType.OK, text=title)
+        md.format_secondary_text(message)
+        md.run()
+        md.destroy()
+
+    # ----------------------------------------------------------------------
+    # Theme Folder Indexing and Loading
+    # ----------------------------------------------------------------------
 
     def on_choose_theme(self, widget):
+        """Let user select icon theme directory."""
         dialog = Gtk.FileChooserDialog(
             title="Select Icon Theme Folder",
             parent=self,
@@ -173,18 +233,17 @@ class IconThemeHelper(Gtk.Window):
             self.theme_path = dialog.get_filename()
             self.indexing_done = False
             self.category_list.set_sensitive(False)
-            self.create_symlink_btn.set_sensitive(True)  # Enable symlink button here
+            self.create_symlink_btn.set_sensitive(True)
             threading.Thread(target=self.index_theme_icons, daemon=True).start()
 
         dialog.destroy()
 
     def index_theme_icons(self):
+        """Scan theme folder for icons and build index."""
         if not self.theme_path:
             return
 
-        # Temporary dict: icon_name -> dict of {ext: full_path}
         icons_found = {}
-
         for root, dirs, files in os.walk(self.theme_path):
             for f in files:
                 if f.endswith((".svg", ".png")):
@@ -193,17 +252,16 @@ class IconThemeHelper(Gtk.Window):
                         icons_found[icon_name] = {}
                     icons_found[icon_name][ext.lower()] = os.path.join(root, f)
 
-        # Build final icon_index preferring svg over png
-        idx = {}
-        for icon_name, exts in icons_found.items():
-            if ".svg" in exts:
-                idx[icon_name] = exts[".svg"]
-            elif ".png" in exts:
-                idx[icon_name] = exts[".png"]
+        # Prefer SVG over PNG
+        idx = {
+            name: exts[".svg"] if ".svg" in exts else exts.get(".png")
+            for name, exts in icons_found.items() if exts
+        }
 
         GLib.idle_add(self.update_icon_index, idx)
 
-    def update_icon_index(self, idx):
+    def update_icon_index(self, idx: Dict[str, str]):
+        """Update icon index and enable category selection."""
         self.icon_index = idx
         self.indexing_done = True
         self.category_list.set_sensitive(True)
@@ -215,17 +273,21 @@ class IconThemeHelper(Gtk.Window):
 
         if self.current_category:
             self.load_icons(self.current_category)
+
         return False
 
-    def refresh_icon(self, changed_filename):
-        base_name, _ = os.path.splitext(changed_filename)
-
+    def refresh_icon(self, changed_filename: str):
+        """Reload icons after changes."""
         if self.current_category:
             self.load_icons(self.current_category)
+        return False
 
-        return False 
+    # ----------------------------------------------------------------------
+    # Category and Icon Display
+    # ----------------------------------------------------------------------
 
     def on_category_selected(self, listbox, row):
+        """Handle category selection."""
         if not row or not self.indexing_done:
             return
 
@@ -233,20 +295,17 @@ class IconThemeHelper(Gtk.Window):
         self.current_category = category_name
         self.load_icons(category_name)
 
-    def load_icons(self, category_name):
-        #print(f"Loading icons for category: {category_name}") #debug
+    def load_icons(self, category_name: str):
+        """Load and display icons for given category based on filters."""
         self.flowbox.foreach(lambda child: self.flowbox.remove(child))
-        self.icon_boxes = []
+        self.icon_boxes.clear()
+
         icon_names = self.icon_categories.get(category_name, [])
 
         for icon_name in icon_names:
             icon_path = self.icon_index.get(icon_name, PLACEHOLDER_PATH)
-
-            # Skip symlinks if filter is enabled
             if not self.show_symlinks and os.path.islink(icon_path):
                 continue
-
-            # Skip symbolic icons if filter is enabled
             if not self.show_symbolic and "symbolic" in icon_name:
                 continue
 
@@ -256,69 +315,76 @@ class IconThemeHelper(Gtk.Window):
 
         self.show_all()
 
-    def on_icon_clicked(self, icon_path, icon_name):
+    # ----------------------------------------------------------------------
+    # Icon Editing and Bitmap Generation
+    # ----------------------------------------------------------------------
+
+    def on_icon_clicked(self, icon_path: str, icon_name: str):
+        """Handle icon click: create/edit SVG and watch for changes."""
         if not self.theme_path or not self.current_category:
-            print("Theme or category not selected")
+            self.show_message("Error", "Theme or category not selected")
             return
 
-        # Determine base directory with current category + "96"
         base_dir = os.path.join(self.theme_path, self.current_category, "96")
         if not os.path.isdir(base_dir):
-            # Fallback to fallback/96 if category folder doesn't exist
             base_dir = os.path.join(self.theme_path, "fallback", "96")
 
         os.makedirs(base_dir, exist_ok=True)
-
         new_icon_path = os.path.join(base_dir, icon_name + ".svg")
 
-        # If icon doesn't exist, create from template
         if not os.path.exists(new_icon_path):
+            if not check_file_exists(TEMPLATE_SVG):
+                self.show_message("Error", f"Missing SVG template: {TEMPLATE_SVG}")
+                return
             try:
                 shutil.copy2(TEMPLATE_SVG, new_icon_path)
-                print(f"Created new icon from template: {new_icon_path}")
             except Exception as e:
-                print(f"Failed to copy template: {e}")
+                self.show_message("Error", f"Failed to copy template: {e}")
                 return
 
         # Open SVG in Inkscape
-        subprocess.Popen(["inkscape", new_icon_path])
+        try:
+            subprocess.Popen(["inkscape", new_icon_path])
+        except Exception as e:
+            self.show_message("Error", f"Failed to launch Inkscape: {e}")
+            return
 
-        def watch_and_generate():
-            last_mtime = os.path.getmtime(new_icon_path)
-            print(f"Watching {new_icon_path} for changes...")
-            while True:
-                time.sleep(2)
-                try:
-                    mtime = os.path.getmtime(new_icon_path)
-                except FileNotFoundError:
-                    print(f"Icon file deleted: {new_icon_path}")
-                    break
-                if mtime != last_mtime:
-                    last_mtime = mtime
-                    print(f"Detected change in {new_icon_path}, generating bitmaps...")
-                    self.generate_bitmaps(new_icon_path)
-                    # After generating bitmaps, update UI on main thread:
-                    GLib.idle_add(self.refresh_icon, os.path.basename(new_icon_path))
-                    break
+        threading.Thread(target=self.watch_and_generate, args=(new_icon_path,), daemon=True).start()
 
-        threading.Thread(target=watch_and_generate, daemon=True).start()
+    def watch_and_generate(self, svg_path: str):
+        """Watch SVG for changes and generate bitmaps when modified."""
+        try:
+            last_mtime = os.path.getmtime(svg_path)
+        except Exception:
+            return
 
-    def generate_bitmaps(self, svg_path):
-        base_name = os.path.splitext(os.path.basename(svg_path))[0]
-
-        # Find category for this icon
-        category = None
-        for cat, icons in self.icon_categories.items():
-            if base_name in icons:
-                category = cat
+        while True:
+            time.sleep(2)
+            try:
+                mtime = os.path.getmtime(svg_path)
+            except FileNotFoundError:
+                print(f"Icon file deleted: {svg_path}")
                 break
-        if not category:
-            category = "fallback"  # fallback category if not found
+
+            if mtime != last_mtime:
+                last_mtime = mtime
+                self.generate_bitmaps(svg_path)
+                GLib.idle_add(self.refresh_icon, os.path.basename(svg_path))
+                break
+
+    def generate_bitmaps(self, svg_path: str):
+        """Export SVG to PNGs of various sizes."""
+        base_name = os.path.splitext(os.path.basename(svg_path))[0]
+        category = next(
+            (cat for cat, icons in self.icon_categories.items() if base_name in icons),
+            "fallback"
+        )
 
         for size in BITMAP_SIZES:
             out_dir = os.path.join(self.theme_path, category, str(size))
             os.makedirs(out_dir, exist_ok=True)
             out_png = os.path.join(out_dir, base_name + ".png")
+
             cmd = [
                 "inkscape",
                 svg_path,
@@ -326,27 +392,21 @@ class IconThemeHelper(Gtk.Window):
                 f"--export-width={size}",
                 f"--export-height={size}",
             ]
+
             try:
                 subprocess.run(cmd, check=True)
-                print(f"Exported {out_png}")
             except subprocess.CalledProcessError as e:
                 print(f"Failed to export bitmap for size {size}: {e}")
 
-        # --- Add this at the end ---
-        # Update icon_index to include the new svg icon path (prefer SVG)
+        # Update icon index and refresh UI
         self.icon_index[base_name] = svg_path
 
-        # Refresh icons on main GTK thread for current category
         if self.current_category:
             GLib.idle_add(self.load_icons, self.current_category)
 
-
-    def show_message(self, title, message):
-        md = Gtk.MessageDialog(parent=self, flags=0, message_type=Gtk.MessageType.INFO,
-                            buttons=Gtk.ButtonsType.OK, text=title)
-        md.format_secondary_text(message)
-        md.run()
-        md.destroy()
+    # ----------------------------------------------------------------------
+    # UI Controls
+    # ----------------------------------------------------------------------
 
     def on_refresh_clicked(self, button):
         if self.current_category:
@@ -362,8 +422,13 @@ class IconThemeHelper(Gtk.Window):
         if self.current_category:
             self.load_icons(self.current_category)
 
+    # ----------------------------------------------------------------------
+    # Symlink Creation Dialog and Logic
+    # ----------------------------------------------------------------------
 
     def on_create_symlink_clicked(self, button):
+        """Show dialog to create symlinks for icons."""
+
         dialog = Gtk.Dialog(title="Create Symlink", transient_for=self, flags=0)
         dialog.add_buttons(
             Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
@@ -382,6 +447,7 @@ class IconThemeHelper(Gtk.Window):
         category_store = Gtk.ListStore(str)
         for cat in sorted(self.icon_categories.keys()):
             category_store.append([cat])
+
         category_combo = Gtk.ComboBox.new_with_model(category_store)
         renderer_text = Gtk.CellRendererText()
         category_combo.pack_start(renderer_text, True)
@@ -420,17 +486,17 @@ class IconThemeHelper(Gtk.Window):
                 category = category_store[category_iter][0]
                 src_name = src_entry.get_text().strip()
                 tgt_name = tgt_entry.get_text().strip()
-
                 if not src_name or not tgt_name:
                     self.show_message("Error", "Source and Target cannot be empty.")
                 else:
                     self.create_symlinks(category, src_name, tgt_name)
                     src_entry.set_text("")
                     tgt_entry.set_text("")
-        else:
-            dialog.destroy()
+        dialog.destroy()
 
-    def create_symlinks(self, category, src_name, tgt_name):
+    def create_symlinks(self, category: str, src_name: str, tgt_name: str):
+        """Create symlinks for SVG and PNG icons in theme."""
+
         if not self.theme_path:
             self.show_message("Error", "No icon theme loaded.")
             return
@@ -443,8 +509,10 @@ class IconThemeHelper(Gtk.Window):
         created_any = False
         errors = []
 
-        # Detect available size directories inside category folder (e.g. 16, 22, 128, etc)
-        available_sizes = [d for d in os.listdir(category_path) if d.isdigit() and os.path.isdir(os.path.join(category_path, d))]
+        available_sizes = [
+            d for d in os.listdir(category_path)
+            if d.isdigit() and os.path.isdir(os.path.join(category_path, d))
+        ]
 
         for size in available_sizes:
             size_dir = os.path.join(category_path, size)
@@ -459,7 +527,6 @@ class IconThemeHelper(Gtk.Window):
                         os.remove(tgt_svg)
                     rel_path = os.path.relpath(src_svg, os.path.dirname(tgt_svg))
                     os.symlink(rel_path, tgt_svg)
-                    print(f"Created SVG symlink: {tgt_svg} -> {rel_path}")
                     created_any = True
                 except Exception as e:
                     errors.append(f"Error creating symlink {tgt_svg}: {e}")
@@ -474,7 +541,6 @@ class IconThemeHelper(Gtk.Window):
                         os.remove(tgt_png)
                     rel_path = os.path.relpath(src_png, os.path.dirname(tgt_png))
                     os.symlink(rel_path, tgt_png)
-                    print(f"Created PNG symlink: {tgt_png} -> {rel_path}")
                     created_any = True
                 except Exception as e:
                     errors.append(f"Error creating symlink {tgt_png}: {e}")
@@ -487,9 +553,13 @@ class IconThemeHelper(Gtk.Window):
         if errors:
             self.show_message("Errors", "\n".join(errors))
 
+
+# --------------------------------------------------------------------------
+# Application Entry Point
+# --------------------------------------------------------------------------
+
 if __name__ == "__main__":
     win = IconThemeHelper()
     win.connect("destroy", Gtk.main_quit)
     win.show_all()
     Gtk.main()
-
