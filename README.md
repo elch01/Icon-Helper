@@ -1,6 +1,9 @@
 # Icon-Helper
 Python utility desgined to help create icon themes on Linux
 
+<img width="1288" height="917" alt="image" src="https://github.com/user-attachments/assets/2ea00c90-b8dc-4c0b-b8ab-97c9e58ee056" />
+
+
 ## Summary
 
 This is like super early in development, but it fits my usecase (Mint-X) for the moment.
