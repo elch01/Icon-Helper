@@ -239,24 +239,38 @@ class IconThemeHelper(Gtk.Window):
         dialog.destroy()
 
     def index_theme_icons(self):
-        """Scan theme folder for icons and build index."""
         if not self.theme_path:
             return
 
         icons_found = {}
+
         for root, dirs, files in os.walk(self.theme_path):
             for f in files:
                 if f.endswith((".svg", ".png")):
                     icon_name, ext = os.path.splitext(f)
                     if icon_name not in icons_found:
-                        icons_found[icon_name] = {}
-                    icons_found[icon_name][ext.lower()] = os.path.join(root, f)
+                        icons_found[icon_name] = {'svg': None, 'pngs': []}
+                    full_path = os.path.join(root, f)
+                    if ext.lower() == ".svg":
+                        icons_found[icon_name]['svg'] = full_path
+                    elif ext.lower() == ".png":
+                        # Try to get size from directory name
+                        parent_dir = os.path.basename(root)
+                        try:
+                            size = int(parent_dir)
+                        except ValueError:
+                            size = 0
+                        icons_found[icon_name]['pngs'].append((size, full_path))
 
-        # Prefer SVG over PNG
-        idx = {
-            name: exts[".svg"] if ".svg" in exts else exts.get(".png")
-            for name, exts in icons_found.items() if exts
-        }
+        # Build final icon_index preferring SVG, otherwise largest PNG
+        idx = {}
+        for icon_name, sources in icons_found.items():
+            if sources['svg']:
+                idx[icon_name] = sources['svg']
+            elif sources['pngs']:
+                # pick largest size
+                largest_png = max(sources['pngs'], key=lambda t: t[0])
+                idx[icon_name] = largest_png[1]
 
         GLib.idle_add(self.update_icon_index, idx)
 
