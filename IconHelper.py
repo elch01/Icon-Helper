@@ -130,6 +130,9 @@ class IconThemeHelper(Gtk.Window):
         self.icon_boxes: List[LazyIconBox] = []
         self.indexing_done: bool = False
 
+        # Search text for filtering icons
+        self.search_text: str = ""
+
         if not check_file_exists(CATEGORIES_FILE):
             self.show_message("Error", f"Missing categories file: {CATEGORIES_FILE}")
             return
@@ -171,6 +174,16 @@ class IconThemeHelper(Gtk.Window):
         sidebar_box.pack_start(refresh_btn, False, False, 0)
         sidebar_box.pack_start(choose_btn, False, False, 0)
         sidebar_box.pack_start(self.category_list, True, True, 0)
+
+        # --- Place the search bar above the checkboxes in the sidebar ---
+        search_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        search_label = Gtk.Label(label="Search:", xalign=0)
+        self.search_entry = Gtk.Entry()
+        self.search_entry.set_placeholder_text("Filter icons by name...")
+        self.search_entry.connect("changed", self.on_search_changed)
+        search_box.pack_start(search_label, False, False, 0)
+        search_box.pack_start(self.search_entry, True, True, 0)
+        sidebar_box.pack_start(search_box, False, False, 0)  # <-- changed position
 
         self.symlink_checkbox = Gtk.CheckButton(label="Show Symlinks")
         self.symlink_checkbox.set_active(False)
@@ -309,12 +322,22 @@ class IconThemeHelper(Gtk.Window):
         self.current_category = category_name
         self.load_icons(category_name)
 
+    def on_search_changed(self, entry):
+        """Handle search bar text change to filter icons."""
+        self.search_text = entry.get_text().strip().lower()
+        if self.current_category:
+            self.load_icons(self.current_category)
+
     def load_icons(self, category_name: str):
-        """Load and display icons for given category based on filters."""
+        """Load and display icons for given category based on filters and search."""
         self.flowbox.foreach(lambda child: self.flowbox.remove(child))
         self.icon_boxes.clear()
 
         icon_names = self.icon_categories.get(category_name, [])
+
+        # Filter by search text
+        if self.search_text:
+            icon_names = [name for name in icon_names if self.search_text in name.lower()]
 
         for icon_name in icon_names:
             icon_path = self.icon_index.get(icon_name, PLACEHOLDER_PATH)
