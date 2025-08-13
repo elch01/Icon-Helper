@@ -6,11 +6,13 @@ import subprocess
 import threading
 import time
 import shutil
-from typing import Callable, Dict, List, Optional
-
+import datetime
 import gi
 gi.require_version('Gtk', '3.0')
-from gi.repository import Gtk, GdkPixbuf, GLib
+import xml.etree.ElementTree as ET
+from typing import Callable, Dict, List, Optional
+from gi.repository import Gtk, GdkPixbuf, GLib, Gdk
+
 
 # --------------------------------------------------------------------------
 # Globals and Constants
@@ -65,9 +67,75 @@ class LazyIconBox(Gtk.EventBox):
         label.set_max_width_chars(15)
         vbox.pack_start(label, False, False, 0)
 
-        self.connect("button-press-event", lambda w, e: self.click_cb(self.icon_path, self.icon_name))
+        self.connect("button-press-event", self.on_button_press)
 
         self.update_icon(icon_path)
+
+        # --- Hover-to-enlarge logic ---
+        self.hover_timeout_id = None
+        self.popup = None
+        self.connect("enter-notify-event", self.on_mouse_enter)
+        self.connect("leave-notify-event", self.on_mouse_leave)
+
+    def on_mouse_enter(self, widget, event):
+        if self.hover_timeout_id is None:
+            self.hover_timeout_id = GLib.timeout_add(2000, self.show_enlarged_preview)
+        return True
+
+    def on_mouse_leave(self, widget, event):
+        # Only remove if it exists
+        if self.hover_timeout_id is not None:
+            try:
+                GLib.source_remove(self.hover_timeout_id)
+            except Exception:
+                pass
+            self.hover_timeout_id = None
+        self.hide_enlarged_preview()
+        return True
+
+    def show_enlarged_preview(self):
+        if self.popup:
+            self.popup.destroy()
+            self.popup = None
+
+        self.popup = Gtk.Window(type=Gtk.WindowType.POPUP)
+        self.popup.set_decorated(False)
+        self.popup.set_border_width(8)
+        self.popup.set_resizable(False)
+
+        # Load larger icon
+        pixbuf = None
+        if self.icon_path and check_file_exists(self.icon_path):
+            try:
+                pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_size(self.icon_path, 512, 512)
+            except Exception as e:
+                print(f"Error loading enlarged icon: {e}")
+
+        if pixbuf is None:
+            pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_size(PLACEHOLDER_PATH, 512, 512)
+
+        image = Gtk.Image.new_from_pixbuf(pixbuf)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        box.pack_start(image, True, True, 0)
+        label = Gtk.Label(label=self.icon_name)
+        box.pack_start(label, False, False, 0)
+        self.popup.add(box)
+        self.popup.show_all()
+
+        # Position the popup near the icon
+        display = Gdk.Display.get_default()
+        pointer = display.get_default_seat().get_pointer()
+        screen, x, y = pointer.get_position()
+        self.popup.move(x + 16, y + 16)
+
+        # Reset the timeout id so it doesn't repeat
+        self.hover_timeout_id = None
+        return False
+
+    def hide_enlarged_preview(self):
+        if self.popup:
+            self.popup.destroy()
+            self.popup = None
 
     def update_icon(self, icon_path: str):
         """Update icon preview and overlays."""
@@ -111,6 +179,52 @@ class LazyIconBox(Gtk.EventBox):
                 self.overlay.add_overlay(self.png_emblem)
                 self.png_emblem.show()
 
+                for attr in ('warning_overlay',):
+                    if hasattr(self, attr):
+                        self.overlay.remove(getattr(self, attr))
+                        delattr(self, attr)
+                        
+        if icon_path.lower().endswith(".svg") and check_file_exists(icon_path):
+            try:
+                size_bytes = os.path.getsize(icon_path)
+                if size_bytes > 1024 * 1024:  # > 1MB
+                    warning_pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_size(
+                        os.path.join(SCRIPT_DIR, "warning-triangle.png"), 20, 20)
+                    warn_eventbox = Gtk.EventBox()
+                    warning_img = Gtk.Image.new_from_pixbuf(warning_pixbuf)
+                    warn_eventbox.add(warning_img)
+                    warn_eventbox.set_tooltip_text("SVG file too large: %.1f MB" % (size_bytes / (1024 * 1024)))
+                    warn_eventbox.set_visible_window(False)
+                    warn_eventbox.set_halign(Gtk.Align.START)
+                    warn_eventbox.set_valign(Gtk.Align.START)
+                    self.warning_overlay = warn_eventbox
+                    self.overlay.add_overlay(self.warning_overlay)
+                    self.warning_overlay.show_all()
+            except Exception as e:
+                print("Validation error:", e)
+
+    def on_button_press(self, widget, event):
+        if event.button == 3 and self.icon_path.lower().endswith(".svg") and not os.path.islink(self.icon_path):
+            self.show_metadata_menu(event)
+            return True  # Prevent further processing
+        elif event.button == 1:
+            self.click_cb(self.icon_path, self.icon_name)
+            return True
+        return False
+
+
+    def show_metadata_menu(self, event):
+        menu = Gtk.Menu()
+        edit_item = Gtk.MenuItem(label="Edit Metadata")
+        edit_item.connect("activate", self.edit_metadata)
+        menu.append(edit_item)
+        menu.show_all()
+        menu.popup(None, None, None, None, event.button, event.time)
+
+    def edit_metadata(self, menu_item):
+        if hasattr(self, 'icon_helper'):
+            self.icon_helper.show_svg_metadata_dialog(self.icon_path)
+
 
 # --------------------------------------------------------------------------
 # IconThemeHelper Main Window
@@ -118,6 +232,8 @@ class LazyIconBox(Gtk.EventBox):
 
 class IconThemeHelper(Gtk.Window):
     """Main application window for icon theme management."""
+
+
 
     def __init__(self):
         super().__init__(title="Icon Theme Helper")
@@ -129,6 +245,11 @@ class IconThemeHelper(Gtk.Window):
         self.icon_index: Dict[str, str] = {}
         self.icon_boxes: List[LazyIconBox] = []
         self.indexing_done: bool = False
+
+        # Set window icon
+        icon_path = os.path.join(SCRIPT_DIR, 'icon-helper-logo.svg')
+        if os.path.exists(icon_path):
+            self.set_icon_from_file(icon_path)
 
         # Search text for filtering icons
         self.search_text: str = ""
@@ -185,15 +306,18 @@ class IconThemeHelper(Gtk.Window):
         search_box.pack_start(self.search_entry, True, True, 0)
         sidebar_box.pack_start(search_box, False, False, 0)  # <-- changed position
 
-        self.symlink_checkbox = Gtk.CheckButton(label="Show Symlinks")
-        self.symlink_checkbox.set_active(False)
-        self.symlink_checkbox.connect("toggled", self.on_symlink_filter_toggled)
-        sidebar_box.pack_start(self.symlink_checkbox, False, False, 0)
-
-        self.toggle_checkbox = Gtk.CheckButton(label="Show Symbolic Icons")
-        self.toggle_checkbox.set_active(False)
-        self.toggle_checkbox.connect("toggled", self.on_symbolic_filter_toggled)
-        sidebar_box.pack_start(self.toggle_checkbox, False, False, 0)
+        self.status_filter_combo = Gtk.ComboBoxText()
+        self.status_filter_combo.append_text("All Icons")
+        self.status_filter_combo.append_text("All Except Symlinks")
+        self.status_filter_combo.append_text("Missing Icons")
+        self.status_filter_combo.append_text("Only SVG")
+        self.status_filter_combo.append_text("Only PNG")
+        self.status_filter_combo.append_text("Symlinks Only")
+        self.status_filter_combo.append_text("Large Files")
+        self.status_filter_combo.set_active(0)
+        self.status_filter_combo.connect("changed", self.on_status_filter_changed)
+        sidebar_box.pack_start(self.status_filter_combo, False, False, 0)
+        self.current_status_filter = "All Icons"
 
         self.create_symlink_btn = Gtk.Button(label="Create Symlink")
         self.create_symlink_btn.set_sensitive(False)
@@ -309,6 +433,7 @@ class IconThemeHelper(Gtk.Window):
             self.load_icons(self.current_category)
         return False
 
+
     # ----------------------------------------------------------------------
     # Category and Icon Display
     # ----------------------------------------------------------------------
@@ -329,28 +454,55 @@ class IconThemeHelper(Gtk.Window):
             self.load_icons(self.current_category)
 
     def load_icons(self, category_name: str):
-        """Load and display icons for given category based on filters and search."""
         self.flowbox.foreach(lambda child: self.flowbox.remove(child))
         self.icon_boxes.clear()
 
         icon_names = self.icon_categories.get(category_name, [])
-
-        # Filter by search text
+        # Filter by search
         if self.search_text:
             icon_names = [name for name in icon_names if self.search_text in name.lower()]
 
+        filtered_names = []
         for icon_name in icon_names:
-            icon_path = self.icon_index.get(icon_name, PLACEHOLDER_PATH)
-            if not self.show_symlinks and os.path.islink(icon_path):
-                continue
-            if not self.show_symbolic and "symbolic" in icon_name:
-                continue
+            icon_path = self.icon_index.get(icon_name)
+            if self.current_status_filter == "All Icons":
+                filtered_names.append(icon_name)
+            elif self.current_status_filter == "Missing Icons":
+                if not icon_path or not os.path.isfile(icon_path):
+                    filtered_names.append(icon_name)
+            elif self.current_status_filter == "Only SVG":
+                if icon_path and icon_path.lower().endswith(".svg"):
+                    filtered_names.append(icon_name)
+            elif self.current_status_filter == "Only PNG":
+                if icon_path and icon_path.lower().endswith(".png"):
+                    filtered_names.append(icon_name)
+            elif self.current_status_filter == "Symlinks Only":
+                if icon_path and os.path.islink(icon_path):
+                    filtered_names.append(icon_name)
+            elif self.current_status_filter == "All Except Symlinks":
+                if icon_path and not os.path.islink(icon_path):
+                    filtered_names.append(icon_name)
+            elif self.current_status_filter == "Large Files":
+                if icon_path and (
+                    (icon_path.lower().endswith(".svg") and os.path.getsize(icon_path) > 1024 * 1024) or
+                    (icon_path.lower().endswith(".png") and os.path.getsize(icon_path) > 1024 * 1024)
+                ):
+                    filtered_names.append(icon_name)
 
+        for icon_name in filtered_names:
+            icon_path = self.icon_index.get(icon_name, PLACEHOLDER_PATH)
             box = LazyIconBox(icon_name, icon_path, self.on_icon_clicked)
+            box.icon_helper = self
             self.flowbox.add(box)
             self.icon_boxes.append(box)
 
         self.show_all()
+
+
+    def on_status_filter_changed(self, combo):
+        self.current_status_filter = combo.get_active_text()
+        if self.current_category:
+            self.load_icons(self.current_category)
 
     # ----------------------------------------------------------------------
     # Icon Editing and Bitmap Generation
@@ -589,6 +741,177 @@ class IconThemeHelper(Gtk.Window):
 
         if errors:
             self.show_message("Errors", "\n".join(errors))
+
+# --------------------------------------------------------------------------
+# Metadata editor
+# --------------------------------------------------------------------------
+
+    def show_svg_metadata_dialog(self, svg_path):
+        # Parse existing metadata
+        tree = ET.parse(svg_path)
+        root = tree.getroot()
+        ns = {
+            'svg': 'http://www.w3.org/2000/svg',
+            'rdf': 'http://www.w3.org/1999/02/22-rdf-syntax-ns#',
+            'cc': 'http://creativecommons.org/ns#',
+            'dc': 'http://purl.org/dc/elements/1.1/'
+        }
+        metadata = root.find('svg:metadata', ns)
+        fields = {
+            "license": "",
+            "author": "",
+            "title": "",
+            "date": "",
+            "contributor": "",
+            "description": ""
+        }
+        if metadata is not None:
+            rdf = metadata.find('rdf:RDF', ns)
+            if rdf is not None:
+                work = rdf.find('cc:Work', ns)
+                if work is not None:
+                    lic = work.find('cc:license', ns)
+                    if lic is not None:
+                        fields["license"] = lic.attrib.get('{%s}resource' % ns['rdf'], "")
+                    creator = work.find('dc:creator', ns)
+                    if creator is not None:
+                        agent = creator.find('cc:Agent', ns)
+                        if agent is not None:
+                            title = agent.find('dc:title', ns)
+                            if title is not None:
+                                fields["author"] = title.text or ""
+                    title = work.find('dc:title', ns)
+                    if title is not None:
+                        fields["title"] = title.text or ""
+                    date = work.find('dc:date', ns)
+                    if date is not None:
+                        fields["date"] = date.text or ""
+                    contributor = work.find('dc:contributor', ns)
+                    if contributor is not None:
+                        agent = contributor.find('cc:Agent', ns)
+                        if agent is not None:
+                            title = agent.find('dc:title', ns)
+                            if title is not None:
+                                fields["contributor"] = title.text or ""
+                    desc = work.find('dc:description', ns)
+                    if desc is not None:
+                        fields["description"] = desc.text or ""
+
+        # Show dialog
+        dialog = Gtk.Dialog(title="Edit SVG Metadata", transient_for=self, flags=0)
+        dialog.set_default_size(500, 600)
+        dialog.set_resizable(False) # feel free to enable it if needed
+        dialog.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, Gtk.STOCK_OK, Gtk.ResponseType.OK)
+        grid = Gtk.Grid(column_spacing=10, row_spacing=10, margin=10)
+        grid.set_hexpand(True)
+        grid.set_vexpand(True)
+        dialog.get_content_area().add(grid)
+
+        # License dropdown and entry
+        license_label = Gtk.Label(label="License:", halign=Gtk.Align.START)
+        license_label.set_hexpand(False)
+        grid.attach(license_label, 0, 0, 1, 1)
+        license_combo = Gtk.ComboBoxText()
+        license_combo.set_hexpand(True)
+        license_urls = {
+            "CC0": "http://creativecommons.org/publicdomain/zero/1.0/",
+            "GPLv3": "https://www.gnu.org/licenses/gpl-3.0.en.html",
+            "MIT": "https://opensource.org/licenses/MIT",
+            "Custom": ""
+        }
+        for name in license_urls:
+            license_combo.append_text(name)
+        lic_text = fields["license"]
+        if lic_text in license_urls.values():
+            lic_idx = list(license_urls.values()).index(lic_text)
+            license_combo.set_active(lic_idx)
+        else:
+            license_combo.set_active(0)
+        grid.attach(license_combo, 1, 0, 1, 1)
+        license_entry = Gtk.Entry()
+        license_entry.set_text(lic_text)
+        license_entry.set_hexpand(True)
+        grid.attach(license_entry, 1, 1, 1, 1)
+        license_entry.set_placeholder_text("License URL (for 'Custom')")
+
+        # Author, title, date, contributor, description
+        def add_row(label_text, value, row):
+            label = Gtk.Label(label=label_text, halign=Gtk.Align.START)
+            label.set_hexpand(False)
+            entry = Gtk.Entry()
+            entry.set_text(value)
+            entry.set_hexpand(True)
+            grid.attach(label, 0, row, 1, 1)
+            grid.attach(entry, 1, row, 1, 1)
+            return entry
+
+        author_entry = add_row("Author:", fields["author"], 2)
+        title_entry = add_row("Title:", fields["title"], 3)
+        date_entry = add_row("Date:", fields["date"], 4)
+        contributor_entry = add_row("Contributor:", fields["contributor"], 5)
+        desc_entry = add_row("Description:", fields["description"], 6)
+
+        def on_license_combo_changed(combo):
+            text = combo.get_active_text()
+            if text and text in license_urls and license_urls[text]:
+                license_entry.set_text(license_urls[text])
+            elif text == "Custom":
+                license_entry.set_text("")
+        license_combo.connect("changed", on_license_combo_changed)
+
+        dialog.show_all()
+        response = dialog.run()
+        if response == Gtk.ResponseType.OK:
+            # Update fields
+            new_fields = {
+                "license": license_entry.get_text(),
+                "author": author_entry.get_text(),
+                "title": title_entry.get_text(),
+                "date": date_entry.get_text() or datetime.date.today().isoformat(),
+                "contributor": contributor_entry.get_text(),
+                "description": desc_entry.get_text()
+            }
+            # Write back to SVG
+            self.write_svg_metadata(svg_path, new_fields)
+        dialog.destroy()
+
+    def write_svg_metadata(self, svg_path, fields):
+        import xml.etree.ElementTree as ET
+        nsmap = {
+            'svg': 'http://www.w3.org/2000/svg',
+            'rdf': 'http://www.w3.org/1999/02/22-rdf-syntax-ns#',
+            'cc': 'http://creativecommons.org/ns#',
+            'dc': 'http://purl.org/dc/elements/1.1/'
+        }
+        for prefix, uri in nsmap.items():
+            ET.register_namespace(prefix, uri)
+        tree = ET.parse(svg_path)
+        root = tree.getroot()
+        metadata = root.find('{%s}metadata' % nsmap['svg'])
+        if metadata is not None:
+            root.remove(metadata)
+        metadata = ET.Element('{%s}metadata' % nsmap['svg'])
+        rdf = ET.SubElement(metadata, '{%s}RDF' % nsmap['rdf'])
+        work = ET.SubElement(rdf, '{%s}Work' % nsmap['cc'], attrib={'{%s}about' % nsmap['rdf']: ""})
+        ET.SubElement(work, '{%s}format' % nsmap['dc']).text = "image/svg+xml"
+        ET.SubElement(work, '{%s}type' % nsmap['dc'], attrib={'{%s}resource' % nsmap['rdf']: "http://purl.org/dc/dcmitype/StillImage"})
+        ET.SubElement(work, '{%s}license' % nsmap['cc'], attrib={'{%s}resource' % nsmap['rdf']: fields["license"]})
+        if fields["author"]:
+            creator = ET.SubElement(work, '{%s}creator' % nsmap['dc'])
+            agent = ET.SubElement(creator, '{%s}Agent' % nsmap['cc'])
+            ET.SubElement(agent, '{%s}title' % nsmap['dc']).text = fields["author"]
+        if fields["title"]:
+            ET.SubElement(work, '{%s}title' % nsmap['dc']).text = fields["title"]
+        if fields["date"]:
+            ET.SubElement(work, '{%s}date' % nsmap['dc']).text = fields["date"]
+        if fields["contributor"]:
+            contributor = ET.SubElement(work, '{%s}contributor' % nsmap['dc'])
+            agent = ET.SubElement(contributor, '{%s}Agent' % nsmap['cc'])
+            ET.SubElement(agent, '{%s}title' % nsmap['dc']).text = fields["contributor"]
+        if fields["description"]:
+            ET.SubElement(work, '{%s}description' % nsmap['dc']).text = fields["description"]
+        root.insert(0, metadata)
+        tree.write(svg_path, encoding="utf-8", xml_declaration=True)
 
 
 # --------------------------------------------------------------------------
