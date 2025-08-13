@@ -1,18 +1,19 @@
 # Icon-Helper
 Python utility desgined to help create icon themes on Linux
 
-<img width="1288" height="917" alt="image" src="https://github.com/user-attachments/assets/2ea00c90-b8dc-4c0b-b8ab-97c9e58ee056" />
-
+<img width="1200" height="822" alt="image" src="https://github.com/user-attachments/assets/069ec476-ba11-4bcb-974b-e8ea2caf5fe7" />
 
 ## Summary
 
 This is like super early in development, but it fits my usecase (Mint-X) for the moment.
 
 - View the entire icon theme from a easy grid view.
+- Preview much larger images of icons by hovering the icon for a couple of seconds
 - Edit icons seamlessly by just clicking on the icon you want to add or adjust and bitmaps will be generated for the 16, 22, 24, 32 and 48 folders.
 - Easy creation of symlinks, always relative!
-- A good base index of icons to read from ```icon_categories.json``` but can be updated using json_generator (more information further down)
-- Toggle hiding symlinks and symbolic icons
+- A good base index of icons to read from ```icon_categories.json``` but can be updated using json_generator (more information further down).
+- Easy to use filtering, showing all icons, Only symlinks, Only Missing and more
+- Edit metadata of .SVG files by right-clicking and pressing "Edit metadata", included are some easy selectors for setting licenses (such as GPL, MIT and CC0), author, title, date, contributors and a description if you want to add such!
 
 ## Pre-requisities
 
@@ -24,7 +25,8 @@ sudo apt install python3 python3-gi python3-gi-cairo gir1.2-gtk-3.0 gir1.2-gdkpi
 ## How to use
 
 - Download the entire repo by pressing the green ```Code``` button at the top and Download the zip file. (or use git clone)
-- Install the Pre-requisities and run the script ```./IconHelper.py```
+- Install the Pre-requisities and make the script runnable with  ```chmod +x IconHelper.py```
+- Run the script ```./IconHelper.py```
 - Press the "Choose Theme Folder" button and select your theme folder (Where the theme.index file is located).
 - Go wild, break the script, create icons with all your heart!
 
