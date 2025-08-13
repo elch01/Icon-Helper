@@ -480,7 +480,7 @@ class IconThemeHelper(Gtk.Window):
                 if icon_path and os.path.islink(icon_path):
                     filtered_names.append(icon_name)
             elif self.current_status_filter == "All Except Symlinks":
-                if icon_path and not os.path.islink(icon_path):
+                if not icon_path or not os.path.islink(icon_path):
                     filtered_names.append(icon_name)
             elif self.current_status_filter == "Large Files":
                 if icon_path and (
