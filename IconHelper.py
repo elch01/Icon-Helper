@@ -20,7 +20,7 @@ from gi.repository import Gtk, GdkPixbuf, GLib, Gdk
 
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 
-PLACEHOLDER_PATH = os.path.join(SCRIPT_DIR, "emblem-unreadable.png")
+PLACEHOLDER_PATH = os.path.join(SCRIPT_DIR, "emblem-unreadable.svg")
 SYMLINK_EMBLEM_PATH = os.path.join(SCRIPT_DIR, "emblem-symlink.png")
 TEMPLATE_SVG = os.path.join(SCRIPT_DIR, "template.svg")
 BITMAP_SIZES = [16, 22, 24, 32, 48]
@@ -189,7 +189,7 @@ class LazyIconBox(Gtk.EventBox):
                 size_bytes = os.path.getsize(icon_path)
                 if size_bytes > 1024 * 1024:  # > 1MB
                     warning_pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_size(
-                        os.path.join(SCRIPT_DIR, "warning-triangle.png"), 20, 20)
+                        os.path.join(SCRIPT_DIR, "warning-triangle.svg"), 20, 20)
                     warn_eventbox = Gtk.EventBox()
                     warning_img = Gtk.Image.new_from_pixbuf(warning_pixbuf)
                     warn_eventbox.add(warning_img)
