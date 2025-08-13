@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!-- Created with Inkscape (http://www.inkscape.org/) -->
+
+<svg
+   version="1.1"
+   id="svg2234"
+   width="21.333332"
+   height="21.333332"
+   viewBox="0 0 21.333332 21.333332"
+   sodipodi:docname="warning-triangle.png"
+   inkscape:version="1.2.2 (b0a8486541, 2022-12-01)"
+   xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"
+   xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"
+   xmlns:xlink="http://www.w3.org/1999/xlink"
+   xmlns="http://www.w3.org/2000/svg"
+   xmlns:svg="http://www.w3.org/2000/svg">
+  <defs
+     id="defs2238" />
+  <sodipodi:namedview
+     id="namedview2236"
+     pagecolor="#ffffff"
+     bordercolor="#000000"
+     borderopacity="0.25"
+     inkscape:showpageshadow="2"
+     inkscape:pageopacity="0.0"
+     inkscape:pagecheckerboard="0"
+     inkscape:deskcolor="#d1d1d1"
+     showgrid="false"
+     inkscape:zoom="24.070314"
+     inkscape:cx="-6.6679645"
+     inkscape:cy="14.790002"
+     inkscape:window-width="5120"
+     inkscape:window-height="1372"
+     inkscape:window-x="0"
+     inkscape:window-y="1440"
+     inkscape:window-maximized="1"
+     inkscape:current-layer="g2240" />
+  <g
+     inkscape:groupmode="layer"
+     inkscape:label="Image"
+     id="g2240">
+    <image
+       width="21.333332"
+       height="21.333332"
+       preserveAspectRatio="none"
+       xlink:href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAACXBIWXMAAAsSAAALEgHS3X78AAAA
+YUlEQVQ4y2NgGNTg/2+G/yCMTw0jPs0oClmxq2Wii9PxeQWfCxhhGmHOx2YIEy6/AzURFTZMODRj
+BBjBQMSnGZ8rSIoFrC6jxHaQeiYyUiIjsjwjkgJGUpMLiGBBF6A7AADGDEDCc28SxwAAAABJRU5E
+rkJggg==
+"
+       id="image2242"
+       style="display:none" />
+    <g
+       id="g7625"
+       transform="translate(-0.42685141,0.01846086)">
+      <path
+         style="opacity:1;fill:none;stroke:#fff930;stroke-width:1.90958;stroke-dasharray:none;stroke-opacity:1"
+         d="M 10.66556,3.9678189 2.4387027,19.154449 H 19.674865 Z"
+         id="path2519" />
+      <rect
+         style="opacity:1;fill:#fff930;fill-opacity:1;stroke:none;stroke-width:1.87189;stroke-dasharray:none;stroke-opacity:1"
+         id="rect4210"
+         width="2.1797051"
+         height="5.9778681"
+         x="9.6344624"
+         y="8.9200897" />
+      <circle
+         style="opacity:1;fill:#fff930;fill-opacity:1;stroke:none;stroke-width:2.192;stroke-dasharray:none;stroke-opacity:1"
+         id="path7413"
+         cx="10.724315"
+         cy="16.627367"
+         r="1.181214" />
+    </g>
+  </g>
+</svg>
