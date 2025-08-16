@@ -204,13 +204,66 @@ class LazyIconBox(Gtk.EventBox):
                 print("Validation error:", e)
 
     def on_button_press(self, widget, event):
-        if event.button == 3 and self.icon_path.lower().endswith(".svg") and not os.path.islink(self.icon_path):
-            self.show_metadata_menu(event)
-            return True  # Prevent further processing
+        # Always allow right-click, even for missing icons
+        if event.button == 3:
+            self.show_context_menu(event)
+            return True
         elif event.button == 1:
             self.click_cb(self.icon_path, self.icon_name)
             return True
         return False
+
+    def delete_icon(self, menu_item):
+        dialog = Gtk.MessageDialog(
+            transient_for=self.get_toplevel(),
+            flags=0,
+            message_type=Gtk.MessageType.QUESTION,
+            buttons=Gtk.ButtonsType.YES_NO,
+            text=f"Delete icon '{self.icon_name}' in all sizes?",
+        )
+        dialog.format_secondary_text(
+            "This will delete all files (PNG, SVG, symlinks) with this name for all sizes in this category."
+        )
+        # Add the "permanently remove" checkbox
+        remove_check = Gtk.CheckButton(label="Permanently remove icon from theme")
+        remove_check.set_tooltip_text("Also remove this icon from the icon list (JSON) so it never appears again.")
+        dialog.get_content_area().pack_start(remove_check, False, False, 0)
+        dialog.show_all()
+        response = dialog.run()
+        remove_from_json = remove_check.get_active()
+        dialog.destroy()
+        if response == Gtk.ResponseType.YES and hasattr(self, 'icon_helper'):
+            self.icon_helper.delete_icon_files(self.icon_name, remove_from_json=remove_from_json)
+
+    
+    def show_context_menu(self, event):
+        menu = Gtk.Menu()
+        is_missing = (self.icon_path == PLACEHOLDER_PATH)
+        is_svg = (
+            not is_missing
+            and self.icon_path.lower().endswith(".svg")
+            and not os.path.islink(self.icon_path)
+        )
+
+        # Edit Metadata only for SVGs that are not symlinks
+        if is_svg:
+            edit_item = Gtk.MenuItem(label="Edit Metadata")
+            edit_item.connect("activate", self.edit_metadata)
+            menu.append(edit_item)
+        
+        # "Clear Existing Icon" for any present icon
+        if not is_missing:
+            clear_item = Gtk.MenuItem(label="Clear Existing Icon")
+            clear_item.connect("activate", self.clear_icon)
+            menu.append(clear_item)
+
+        # "Permanently Remove" always available
+        remove_item = Gtk.MenuItem(label="Permanently remove icon from theme")
+        remove_item.connect("activate", self.permanently_remove_icon)
+        menu.append(remove_item)
+
+        menu.show_all()
+        menu.popup(None, None, None, None, event.button, event.time)
 
 
     def show_metadata_menu(self, event):
@@ -224,6 +277,43 @@ class LazyIconBox(Gtk.EventBox):
     def edit_metadata(self, menu_item):
         if hasattr(self, 'icon_helper'):
             self.icon_helper.show_svg_metadata_dialog(self.icon_path)
+
+    
+    def clear_icon(self, menu_item):
+        dialog = Gtk.MessageDialog(
+            transient_for=self.get_toplevel(),
+            flags=0,
+            message_type=Gtk.MessageType.QUESTION,
+            buttons=Gtk.ButtonsType.YES_NO,
+            text=f"Clear '{self.icon_name}'?",
+        )
+        dialog.format_secondary_text(
+            "This will clear the existing bitmaps and svg files from the theme and leave a empty icon."
+        )
+        dialog.show_all()
+        response = dialog.run()
+        dialog.destroy()
+        if hasattr(self, 'icon_helper'):
+            self.icon_helper.delete_icon_files(self.icon_name, remove_from_json=False)
+
+    
+    def permanently_remove_icon(self, menu_item):
+        dialog = Gtk.MessageDialog(
+            transient_for=self.get_toplevel(),
+            flags=0,
+            message_type=Gtk.MessageType.QUESTION,
+            buttons=Gtk.ButtonsType.YES_NO,
+            text=f"Permanently remove '{self.icon_name}' from the theme?",
+        )
+        dialog.format_secondary_text(
+            "This will remove the icon from the icon list and it will not show up (even as missing) in this category."
+        )
+        dialog.show_all()
+        response = dialog.run()
+        dialog.destroy()
+        if hasattr(self, 'icon_helper'):
+            self.icon_helper.delete_icon_files(self.icon_name, remove_from_json=True)
+
 
 
 # --------------------------------------------------------------------------
@@ -913,6 +1003,53 @@ class IconThemeHelper(Gtk.Window):
         root.insert(0, metadata)
         tree.write(svg_path, encoding="utf-8", xml_declaration=True)
 
+# --------------------------------------------------------------------------
+# Delete icons function
+# --------------------------------------------------------------------------
+
+    def delete_icon_files(self, icon_name, remove_from_json=False):
+        if not self.theme_path or not self.current_category:
+            self.show_message("Error", "Theme or category not selected")
+            return
+
+        category_path = os.path.join(self.theme_path, self.current_category)
+        if not os.path.isdir(category_path):
+            self.show_message("Error", f"Category folder '{self.current_category}' not found in theme.")
+            return
+
+        deleted = []
+        for size in os.listdir(category_path):
+            size_dir = os.path.join(category_path, size)
+            if not os.path.isdir(size_dir):
+                continue
+            for ext in (".svg", ".png"):
+                file_path = os.path.join(size_dir, icon_name + ext)
+                if os.path.lexists(file_path):
+                    try:
+                        os.remove(file_path)
+                        print(f"Deleted: {file_path}")  # Show path in terminal
+                        deleted.append(file_path)
+                    except Exception as e:
+                        print(f"Failed to delete {file_path}: {e}")
+        if deleted:
+            self.show_message("Deleted", f"Deleted {len(deleted)} files for icon '{icon_name}'.")
+        else:
+            print(f"No files deleted for icon: {icon_name}")
+            self.show_message("Info", f"No files found to delete for icon '{icon_name}'.")
+        if remove_from_json:
+            icons = self.icon_categories.get(self.current_category, [])
+            if icon_name in icons:
+                icons.remove(icon_name)
+                # Save back to file
+                try:
+                    with open(CATEGORIES_FILE, "w") as f:
+                        json.dump(self.icon_categories, f, indent=2)
+                    print(f"Removed {icon_name} from JSON for category {self.current_category}")
+                except Exception as e:
+                    print(f"Failed to update JSON: {e}")
+
+        if self.current_category:
+            self.load_icons(self.current_category)
 
 # --------------------------------------------------------------------------
 # Application Entry Point
