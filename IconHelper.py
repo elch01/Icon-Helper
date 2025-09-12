@@ -966,42 +966,68 @@ class IconThemeHelper(Gtk.Window):
         dialog.destroy()
 
     def write_svg_metadata(self, svg_path, fields):
-        import xml.etree.ElementTree as ET
-        nsmap = {
-            'svg': 'http://www.w3.org/2000/svg',
-            'rdf': 'http://www.w3.org/1999/02/22-rdf-syntax-ns#',
-            'cc': 'http://creativecommons.org/ns#',
-            'dc': 'http://purl.org/dc/elements/1.1/'
-        }
-        for prefix, uri in nsmap.items():
-            ET.register_namespace(prefix, uri)
-        tree = ET.parse(svg_path)
-        root = tree.getroot()
-        metadata = root.find('{%s}metadata' % nsmap['svg'])
-        if metadata is not None:
-            root.remove(metadata)
-        metadata = ET.Element('{%s}metadata' % nsmap['svg'])
-        rdf = ET.SubElement(metadata, '{%s}RDF' % nsmap['rdf'])
-        work = ET.SubElement(rdf, '{%s}Work' % nsmap['cc'], attrib={'{%s}about' % nsmap['rdf']: ""})
-        ET.SubElement(work, '{%s}format' % nsmap['dc']).text = "image/svg+xml"
-        ET.SubElement(work, '{%s}type' % nsmap['dc'], attrib={'{%s}resource' % nsmap['rdf']: "http://purl.org/dc/dcmitype/StillImage"})
-        ET.SubElement(work, '{%s}license' % nsmap['cc'], attrib={'{%s}resource' % nsmap['rdf']: fields["license"]})
-        if fields["author"]:
-            creator = ET.SubElement(work, '{%s}creator' % nsmap['dc'])
-            agent = ET.SubElement(creator, '{%s}Agent' % nsmap['cc'])
-            ET.SubElement(agent, '{%s}title' % nsmap['dc']).text = fields["author"]
-        if fields["title"]:
-            ET.SubElement(work, '{%s}title' % nsmap['dc']).text = fields["title"]
-        if fields["date"]:
-            ET.SubElement(work, '{%s}date' % nsmap['dc']).text = fields["date"]
-        if fields["contributor"]:
-            contributor = ET.SubElement(work, '{%s}contributor' % nsmap['dc'])
-            agent = ET.SubElement(contributor, '{%s}Agent' % nsmap['cc'])
-            ET.SubElement(agent, '{%s}title' % nsmap['dc']).text = fields["contributor"]
-        if fields["description"]:
-            ET.SubElement(work, '{%s}description' % nsmap['dc']).text = fields["description"]
-        root.insert(0, metadata)
-        tree.write(svg_path, encoding="utf-8", xml_declaration=True)
+        """
+        Replace the <metadata>...</metadata> block in the SVG file with new metadata.
+        fields: dict with keys license, author, title, date, contributor, description
+        """
+        import re
+
+        # 1. Read the SVG file as text
+        with open(svg_path, "r", encoding="utf-8") as f:
+            svg_text = f.read()
+
+        # 2. Remove existing <metadata>...</metadata> block (non-greedy, multiline)
+        svg_text = re.sub(
+            r"<metadata[\s\S]*?</metadata>\n?", 
+            "", 
+            svg_text, 
+            flags=re.IGNORECASE
+        )
+
+        # 3. Build new metadata block
+        metadata_block = f'''  <metadata
+        id="metadata2">
+        <rdf:RDF>
+        <cc:Work
+            rdf:about="">
+            <dc:format>image/svg+xml</dc:format>
+            <dc:type
+            rdf:resource="http://purl.org/dc/dcmitype/StillImage" />
+            <cc:license
+            rdf:resource="{fields.get("license", "")}" />
+            <dc:creator>
+            <cc:Agent>
+                <dc:title>{fields.get("author", "")}</dc:title>
+            </cc:Agent>
+            </dc:creator>
+            <dc:title>{fields.get("title", "")}</dc:title>
+            <dc:date>{fields.get("date", "")}</dc:date>
+            <dc:description>{fields.get("description", "")}</dc:description>
+            <dc:contributor>
+            <cc:Agent>
+                <dc:title>{fields.get("contributor", "")}</dc:title>
+            </cc:Agent>
+            </dc:contributor>
+        </cc:Work>
+        </rdf:RDF>
+    </metadata>
+    '''
+
+        # 4. Insert metadata after opening <svg ...> tag
+        # Find the position after the first > following <svg ...>
+        svg_opening_match = re.search(r"<svg[^>]*>", svg_text, flags=re.IGNORECASE)
+        if svg_opening_match:
+            insert_pos = svg_opening_match.end()
+            svg_text = svg_text[:insert_pos] + "\n" + metadata_block + svg_text[insert_pos:]
+        else:
+            # fallback: prepend metadata at start of file if SVG tag not found
+            svg_text = metadata_block + "\n" + svg_text
+
+        # 5. Write the modified SVG back
+        with open(svg_path, "w", encoding="utf-8") as f:
+            f.write(svg_text)
+
+
 
 # --------------------------------------------------------------------------
 # Delete icons function
