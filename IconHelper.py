@@ -1850,8 +1850,9 @@ class IconThemeHelper(Gtk.Window):
 
         hbox.pack_start(right_vbox, True, True, 0)
 
-        # populate listbox with backups
-        rows = []
+        # populate listbox with backups (use mapping for robust lookup)
+        rows: List[Tuple[Gtk.ListBoxRow, str]] = []
+        row_to_path: Dict[Gtk.ListBoxRow, str] = {}
         idx = _load_backup_index()
         for bp in backups:
             uid = os.path.splitext(os.path.basename(bp))[0]
@@ -1870,51 +1871,74 @@ class IconThemeHelper(Gtk.Window):
             row.add(h)
             listbox.add(row)
             rows.append((row, bp))
+            row_to_path[row] = bp
 
-        # helper to update preview when selection changes
-        def _on_sel_changed(lb):
-            sel = lb.get_selected_row()
+        def _on_sel_changed(lb, sel):
+            # show placeholder while loading or if nothing selected
+            preview_image.set_from_pixbuf(get_or_load_pixbuf_sync(PLACEHOLDER_PATH, 256))
             if not sel:
-                preview_image.set_from_pixbuf(get_or_load_pixbuf_sync(PLACEHOLDER_PATH, 256))
                 return
-            for r, bp in rows:
-                if r is sel:
-                    def _set(pb):
-                        try:
-                            preview_image.set_from_pixbuf(pb)
-                        except Exception:
-                            pass
-                    enqueue_pixbuf_load(bp, 256, _set)
-                    break
+            bp = row_to_path.get(sel)
+            if not bp:
+                return
+
+            # Enqueue async load, but verify selection hasn't changed before setting image.
+            expected = bp
+
+            def _set(pb, expected_path=expected):
+                cur = listbox.get_selected_row()
+                cur_path = row_to_path.get(cur) if cur else None
+                if cur_path == expected_path:
+                    try:
+                        preview_image.set_from_pixbuf(pb)
+                    except Exception:
+                        pass
+                # otherwise discard this callback silently (a newer selection took place)
+
+            enqueue_pixbuf_load(bp, 256, _set)
 
         listbox.connect("row-selected", _on_sel_changed)
 
-        # action handlers
+        dialog.show_all()
+
+        # select the first row (if any) so the preview is shown immediately
+        if rows:
+            try:
+                first_row = rows[0][0]
+                listbox.select_row(first_row)
+                # handler will enqueue preview load
+            except Exception:
+                pass
+
+        # action handlers using the mapping
         def _restore_clicked(w):
             sel = listbox.get_selected_row()
             if not sel:
                 self.show_message("Info", "No selection")
                 return
-            for r, bp in rows:
-                if r is sel:
-                    self.restore_backup(bp)
-                    break
+            bp = row_to_path.get(sel)
+            if bp:
+                self.restore_backup(bp)
 
         def _delete_clicked(w):
             sel = listbox.get_selected_row()
             if not sel:
                 self.show_message("Info", "No selection")
                 return
-            for r, bp in list(rows):
-                if r is sel:
-                    self.delete_backup_file(bp)
-                    try:
-                        listbox.remove(r)
-                    except Exception:
-                        pass
-                    rows.remove((r, bp))
-                    preview_image.set_from_pixbuf(get_or_load_pixbuf_sync(PLACEHOLDER_PATH, 256))
-                    break
+            bp = row_to_path.get(sel)
+            if not bp:
+                return
+            # remove from disk and index
+            self.delete_backup_file(bp)
+            # remove row widget
+            try:
+                listbox.remove(sel)
+            except Exception:
+                pass
+            # update local mappings
+            rows[:] = [(r, p) for (r, p) in rows if r is not sel]
+            row_to_path.pop(sel, None)
+            preview_image.set_from_pixbuf(get_or_load_pixbuf_sync(PLACEHOLDER_PATH, 256))
 
         def _clear_all(w):
             confirm = Gtk.MessageDialog(transient_for=self, flags=0,
@@ -1924,30 +1948,23 @@ class IconThemeHelper(Gtk.Window):
             resp = confirm.run()
             confirm.destroy()
             if resp == Gtk.ResponseType.YES:
+                # iterate a snapshot of paths
                 for r, bp in list(rows):
-                    self.delete_backup_file(bp)
+                    try:
+                        self.delete_backup_file(bp)
+                    except Exception:
+                        pass
                     try:
                         listbox.remove(r)
                     except Exception:
                         pass
                 rows.clear()
+                row_to_path.clear()
                 preview_image.set_from_pixbuf(get_or_load_pixbuf_sync(PLACEHOLDER_PATH, 256))
 
         restore_btn.connect("clicked", _restore_clicked)
         delete_btn.connect("clicked", _delete_clicked)
         clear_btn.connect("clicked", _clear_all)
-
-        dialog.show_all()
-
-        # select the first row (if any) so the preview is shown immediately
-        if rows:
-            try:
-                first_row = rows[0][0]
-                listbox.select_row(first_row)
-                # call handler once to populate preview immediately
-                _on_sel_changed(listbox)
-            except Exception:
-                pass
 
         dialog.run()
         dialog.destroy()
