@@ -10,6 +10,7 @@ import datetime
 import gi
 gi.require_version('Gtk', '3.0')
 import xml.etree.ElementTree as ET
+import xml.sax
 from typing import Callable, Dict, List, Optional, Tuple
 from gi.repository import Gtk, GdkPixbuf, GLib, Gdk
 import tempfile
@@ -17,6 +18,7 @@ from collections import OrderedDict
 import hashlib
 from pathlib import Path
 import queue
+import re
 
 # --------------------------------------------------------------------------
 # Globals and Constants
@@ -35,15 +37,20 @@ PNG_EMBLEM = os.path.join(SCRIPT_DIR, "emblem-png.png")
 # Config file
 CONFIG_FILE = os.path.join(SCRIPT_DIR, "iconhelper_config.json")
 
-# Supersampling defaults (we keep existing controls)
+# Supersampling defaults (we keep existing controls but will expose via Settings)
 SUPERSAMPLE_ENABLED = True
 SUPERSAMPLE_FACTOR = 3
 
-# Disk cache defaults
+# Disk cache defaults (exposed via Settings)
 DEFAULT_DISK_CACHE_DIR = os.path.join(SCRIPT_DIR, ".thumbcache")
 DISK_CACHE_ENABLED = True
 DISK_CACHE_DIR = DEFAULT_DISK_CACHE_DIR
 DISK_CACHE_SIZE_LIMIT = 200 * 1024 * 1024  # 200MB default
+
+# Mint-Y export defaults (new settings)
+MINTY_ENABLED = False
+MINTY_EXPORT_PATH = ""  # when set, used as export root for Mint-Y style (can be absolute or inside theme)
+MINTY_2X_ENABLED = True  # create @2x variants
 
 # Loader pool defaults
 PIXBUF_WORKER_COUNT = 6
@@ -68,6 +75,24 @@ ACTIVE_PREVIEWS_LOCK = threading.Lock()
 # Loader task queue; tasks are (path, size, callback)
 _LOADER_QUEUE: "queue.Queue[Tuple[str,int,Callable]]" = queue.Queue()
 _WORKERS_STARTED = False
+
+# Mint-Y style rendering DPI factors (1x, optionally 2x for HiDPI)
+MINTY_DPI_FACTORS = [1, 2]
+
+# Detect inkscape DPI behaviour similar to moka script (90 vs 96)
+try:
+    ver_raw = subprocess.check_output(["inkscape", "-V"], stderr=subprocess.STDOUT).decode()
+    m = re.search(r'(\d+)\.(\d+)', ver_raw)
+    if m:
+        major = int(m.group(1)); minor = int(m.group(2))
+        if major == 0 and minor < 92:
+            DPI_1_TO_1 = 90
+        else:
+            DPI_1_TO_1 = 96
+    else:
+        DPI_1_TO_1 = 96
+except Exception:
+    DPI_1_TO_1 = 96
 
 # --------------------------------------------------------------------------
 # Global backups (stored under SCRIPT_DIR, NOT inside themes)
@@ -109,6 +134,7 @@ def _save_backup_index(idx: Dict[str, Dict]):
 def load_config():
     global SUPERSAMPLE_ENABLED, SUPERSAMPLE_FACTOR, DISK_CACHE_ENABLED, DISK_CACHE_DIR, DISK_CACHE_SIZE_LIMIT
     global PIXBUF_WORKER_COUNT, ICON_PAGE_SIZE, MAX_SVG_BACKUPS
+    global MINTY_ENABLED, MINTY_EXPORT_PATH, MINTY_2X_ENABLED
     try:
         if os.path.isfile(CONFIG_FILE):
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
@@ -121,6 +147,9 @@ def load_config():
             PIXBUF_WORKER_COUNT = int(cfg.get("pixbuf_worker_count", PIXBUF_WORKER_COUNT))
             ICON_PAGE_SIZE = int(cfg.get("icon_page_size", ICON_PAGE_SIZE))
             MAX_SVG_BACKUPS = int(cfg.get("max_svg_backups", MAX_SVG_BACKUPS))
+            MINTY_ENABLED = bool(cfg.get("minty_enabled", MINTY_ENABLED))
+            MINTY_EXPORT_PATH = cfg.get("minty_export_path", MINTY_EXPORT_PATH)
+            MINTY_2X_ENABLED = bool(cfg.get("minty_2x_enabled", MINTY_2X_ENABLED))
     except Exception as e:
         print(f"Failed to load config {CONFIG_FILE}: {e}")
 
@@ -135,6 +164,9 @@ def save_config():
             "pixbuf_worker_count": PIXBUF_WORKER_COUNT,
             "icon_page_size": ICON_PAGE_SIZE,
             "max_svg_backups": MAX_SVG_BACKUPS,
+            "minty_enabled": MINTY_ENABLED,
+            "minty_export_path": MINTY_EXPORT_PATH,
+            "minty_2x_enabled": MINTY_2X_ENABLED
         }
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=2)
@@ -264,7 +296,7 @@ def _prune_disk_cache_if_needed():
     except Exception as e:
         print(f"Disk prune error: {e}")
 
-# store disk cache and update index (atomic)
+# store disk cache and update index (atomic, robust)
 def store_disk_cache(path: str, size: int, pixbuf: GdkPixbuf.Pixbuf):
     if not DISK_CACHE_ENABLED:
         return
@@ -273,11 +305,19 @@ def store_disk_cache(path: str, size: int, pixbuf: GdkPixbuf.Pixbuf):
         cache_path = get_disk_cache_path(path, size)
         if not cache_path:
             return
-        tmp = cache_path + ".tmp"
+        # create a tmp file inside the cache dir to avoid cross-filesystem/permission races
+        tmp = None
         try:
+            # create named temp file in disk cache dir
+            with tempfile.NamedTemporaryFile(dir=DISK_CACHE_DIR, delete=False, suffix=".png.tmp") as tf:
+                tmp = tf.name
+            # Try saving via GdkPixbuf first
+            saved = False
             try:
                 pixbuf.savev(tmp, "png", [], [])
+                saved = True
             except Exception:
+                # fallback to PIL if available
                 try:
                     from PIL import Image
                     buf = pixbuf.get_pixels()
@@ -288,22 +328,40 @@ def store_disk_cache(path: str, size: int, pixbuf: GdkPixbuf.Pixbuf):
                     mode = "RGBA" if has_alpha else "RGB"
                     img = Image.frombytes(mode, (width, height), buf, "raw", mode, rowstride)
                     img.save(tmp, format="PNG")
+                    saved = True
                 except Exception:
+                    # last-ditch: try pixbuf.savev again (some pixbuf implementations behave differently)
                     try:
                         pixbuf.savev(tmp, "png", [], [])
+                        saved = True
                     except Exception:
-                        pass
-            if os.path.exists(tmp):
-                os.replace(tmp, cache_path)
-                with DISK_CACHE_LOCK:
-                    idx = _load_disk_index()
-                    key = _cache_key_for(path, size)
-                    stat = os.stat(cache_path)
-                    idx[key] = {"fname": os.path.basename(cache_path), "size": stat.st_size, "last_used": int(time.time())}
-                    _save_disk_index(idx)
-                threading.Thread(target=_prune_disk_cache_if_needed, daemon=True).start()
+                        saved = False
+            if saved and os.path.exists(tmp):
+                try:
+                    os.replace(tmp, cache_path)
+                except FileNotFoundError:
+                    # tmp got removed concurrently; ignore
+                    pass
+                except Exception as e:
+                    print(f"Failed to move temp cache file into place: {e}")
+                try:
+                    with DISK_CACHE_LOCK:
+                        idx = _load_disk_index()
+                        key = _cache_key_for(path, size)
+                        try:
+                            stat = os.stat(cache_path)
+                            idx[key] = {"fname": os.path.basename(cache_path), "size": stat.st_size, "last_used": int(time.time())}
+                            _save_disk_index(idx)
+                        except Exception:
+                            # if stat fails, still try to record something
+                            idx[key] = {"fname": os.path.basename(cache_path), "size": 0, "last_used": int(time.time())}
+                            _save_disk_index(idx)
+                    threading.Thread(target=_prune_disk_cache_if_needed, daemon=True).start()
+                except Exception as e:
+                    print(f"Failed to update disk cache index: {e}")
         finally:
-            if os.path.exists(tmp):
+            # cleanup tmp if still present
+            if tmp and os.path.exists(tmp):
                 try:
                     os.remove(tmp)
                 except Exception:
@@ -343,7 +401,7 @@ def invalidate_disk_cache_for_path(path: str):
             idx = _load_disk_index()
             if not isinstance(idx, dict):
                 return
-            for size in BITMAP_SIZES + [64, 512]:
+            for size in BITMAP_SIZES + [64, 96, 256, 512]:
                 key = _cache_key_for(path, size)
                 meta = idx.pop(key, None)
                 if meta and isinstance(meta, dict):
@@ -907,6 +965,13 @@ class IconThemeHelper(Gtk.Window):
         self.icon_index: Dict[str, str] = {}
         self.icon_boxes: List[LazyIconBox] = []
         self.indexing_done: bool = False
+        self._export_progress_dialog = None
+        self._export_progress_bar = None
+        self._export_progress_label = None
+        self._export_total_tasks = 0
+        self._export_done_tasks = 0
+        self._export_cancel_requested = False
+        self._export_lock = threading.Lock()
 
         icon_path = os.path.join(SCRIPT_DIR, 'icon-helper-logo.svg')
         if os.path.exists(icon_path):
@@ -927,6 +992,8 @@ class IconThemeHelper(Gtk.Window):
 
         self._page_loaded_until = 0
         self._current_filtered_list: List[str] = []
+        self.current_status_filter = "All Icons"
+
 
         self.setup_ui()
 
@@ -936,6 +1003,17 @@ class IconThemeHelper(Gtk.Window):
 
         sidebar_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
 
+        # Top controls: Refresh & Choose Theme
+        top_btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        refresh_btn = Gtk.Button(label="Refresh Icons")
+        refresh_btn.connect("clicked", self.on_refresh_clicked)
+        choose_btn = Gtk.Button(label="Choose Theme Folder")
+        choose_btn.connect("clicked", self.on_choose_theme)
+        top_btn_box.pack_start(refresh_btn, True, True, 0)
+        top_btn_box.pack_start(choose_btn, True, True, 0)
+        sidebar_box.pack_start(top_btn_box, False, False, 0)
+
+        # Category list (keeps most prominent position)
         self.category_list = Gtk.ListBox()
         self.category_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
         self.category_list.connect("row-selected", self.on_category_selected)
@@ -947,21 +1025,9 @@ class IconThemeHelper(Gtk.Window):
             row.add(label)
             self.category_list.add(row)
 
-        choose_btn = Gtk.Button(label="Choose Theme Folder")
-        choose_btn.connect("clicked", self.on_choose_theme)
-
-        refresh_btn = Gtk.Button(label="Refresh Icons")
-        refresh_btn.connect("clicked", self.on_refresh_clicked)
-        sidebar_box.pack_start(refresh_btn, False, False, 0)
-        sidebar_box.pack_start(choose_btn, False, False, 0)
         sidebar_box.pack_start(self.category_list, True, True, 0)
 
-        install_btn = Gtk.Button(label="Install Theme")
-        install_btn.set_sensitive(False)
-        install_btn.connect("clicked", self.on_install_theme_clicked)
-        self.install_btn = install_btn
-        sidebar_box.pack_start(install_btn, False, False, 0)
-
+        # Search -- placed directly under category list
         search_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         search_label = Gtk.Label(label="Search:", xalign=0)
         self.search_entry = Gtk.Entry()
@@ -971,41 +1037,39 @@ class IconThemeHelper(Gtk.Window):
         search_box.pack_start(self.search_entry, True, True, 0)
         sidebar_box.pack_start(search_box, False, False, 0)
 
-        ss_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        self.supersample_check = Gtk.CheckButton(label="Supersample")
-        self.supersample_check.set_active(bool(SUPERSAMPLE_ENABLED))
-        self.supersample_check.connect("toggled", self.on_supersample_toggled)
-        ss_box.pack_start(self.supersample_check, False, False, 0)
-        adj = Gtk.Adjustment(value=SUPERSAMPLE_FACTOR, lower=2, upper=6, step_increment=1)
-        self.supersample_spin = Gtk.SpinButton(adjustment=adj, numeric=True)
-        self.supersample_spin.set_value(SUPERSAMPLE_FACTOR)
-        self.supersample_spin.connect("value-changed", self.on_supersample_factor_changed)
-        ss_box.pack_start(self.supersample_spin, False, False, 0)
-        sidebar_box.pack_start(ss_box, False, False, 0)
+        # Export mode indicator -- under Search
+        self.export_mode_label = Gtk.Label(label=self._export_mode_text(), xalign=0)
+        sidebar_box.pack_start(self.export_mode_label, False, False, 0)
 
-        self.disk_cache_check = Gtk.CheckButton(label="Use disk thumbnail cache")
-        self.disk_cache_check.set_active(bool(DISK_CACHE_ENABLED))
-        self.disk_cache_check.connect("toggled", self.on_disk_cache_toggled)
-        sidebar_box.pack_start(self.disk_cache_check, False, False, 0)
-
-        self.cache_size_label = Gtk.Label(label=f"Disk cache limit: {DISK_CACHE_SIZE_LIMIT//(1024*1024)} MB", xalign=0)
-        sidebar_box.pack_start(self.cache_size_label, False, False, 0)
-
-        self.status_filter_combo = Gtk.ComboBoxText()
-        for t in ["All Icons", "All Except Symlinks", "Missing Icons", "Only SVG", "Only PNG", "Symlinks Only", "Large Files"]:
-            self.status_filter_combo.append_text(t)
-        self.status_filter_combo.set_active(0)
-        self.status_filter_combo.connect("changed", self.on_status_filter_changed)
-        sidebar_box.pack_start(self.status_filter_combo, False, False, 0)
-        self.current_status_filter = "All Icons"
-
+        # Create Symlink button -- under export mode
         self.create_symlink_btn = Gtk.Button(label="Create Symlink")
         self.create_symlink_btn.set_sensitive(False)
         self.create_symlink_btn.connect("clicked", self.on_create_symlink_clicked)
         sidebar_box.pack_start(self.create_symlink_btn, False, False, 0)
 
+        # Icon grid filter dropdown -- under Create Symlink
+        self.status_filter_combo = Gtk.ComboBoxText()
+        filter_items = ["All Icons", "All Except Symlinks", "Missing Icons", "Only SVG", "Only PNG", "Symlinks Only", "Large Files"]
+        for t in filter_items:
+            self.status_filter_combo.append_text(t)
+        # set active to current_status_filter if present
+        try:
+            idx = filter_items.index(getattr(self, "current_status_filter", "All Icons"))
+        except Exception:
+            idx = 0
+        self.status_filter_combo.set_active(idx)
+        self.status_filter_combo.connect("changed", self.on_status_filter_changed)
+        sidebar_box.pack_start(self.status_filter_combo, False, False, 0)
+
+        # Settings button -- under the filter dropdown
+        settings_btn = Gtk.Button(label="Settings...")
+        settings_btn.connect("clicked", self.on_settings_clicked)
+        self.settings_btn = settings_btn
+        sidebar_box.pack_start(settings_btn, False, False, 0)
+
         main_box.pack_start(sidebar_box, False, False, 0)
 
+        # Icon grid area
         self.flowbox = Gtk.FlowBox()
         self.flowbox.set_valign(Gtk.Align.START)
         self.flowbox.set_max_children_per_line(10)
@@ -1015,31 +1079,255 @@ class IconThemeHelper(Gtk.Window):
         self.scrolled.add(self.flowbox)
         main_box.pack_start(self.scrolled, True, True, 0)
 
+        # connect scroll adjustment for incremental loading
         vadj = self.scrolled.get_vadjustment()
         vadj.connect("value-changed", self.on_scroll_adjustment)
 
+    def _export_mode_text(self):
+        if MINTY_ENABLED:
+            return "Export mode: Mint-Y style"
+        else:
+            return "Export mode: Mint-X Style"
+
     # ----------------------------------------------------------------------
-    # UI callbacks for supersampling / cache toggles
+    # UI callbacks for supersampling / cache toggles are now in Settings
     # ----------------------------------------------------------------------
-    def on_supersample_toggled(self, widget):
+    def on_supersample_toggled(self, widget_or_bool):
         global SUPERSAMPLE_ENABLED
-        SUPERSAMPLE_ENABLED = widget.get_active()
+        # widget_or_bool may be a CheckButton or a boolean
+        if isinstance(widget_or_bool, Gtk.CheckButton):
+            SUPERSAMPLE_ENABLED = widget_or_bool.get_active()
+        else:
+            SUPERSAMPLE_ENABLED = bool(widget_or_bool)
         save_config()
 
-    def on_supersample_factor_changed(self, widget):
+    def on_supersample_factor_changed(self, widget_or_value):
         global SUPERSAMPLE_FACTOR
         try:
-            SUPERSAMPLE_FACTOR = int(widget.get_value_as_int())
+            if isinstance(widget_or_value, Gtk.SpinButton):
+                SUPERSAMPLE_FACTOR = int(widget_or_value.get_value_as_int())
+            else:
+                SUPERSAMPLE_FACTOR = int(widget_or_value)
         except Exception:
             SUPERSAMPLE_FACTOR = 3
         save_config()
 
-    def on_disk_cache_toggled(self, widget):
+    def on_disk_cache_toggled(self, widget_or_bool):
         global DISK_CACHE_ENABLED
-        DISK_CACHE_ENABLED = widget.get_active()
+        if isinstance(widget_or_bool, Gtk.CheckButton):
+            DISK_CACHE_ENABLED = widget_or_bool.get_active()
+        else:
+            DISK_CACHE_ENABLED = bool(widget_or_bool)
         if DISK_CACHE_ENABLED:
             ensure_disk_cache_dir()
         save_config()
+
+    def _start_export_progress(self, total: int, title: str = "Exporting icons..."):
+        """
+        Create and show a modal progress dialog. Called from background thread via GLib.idle_add.
+        """
+        def _create():
+            # destroy existing if present
+            try:
+                if self._export_progress_dialog:
+                    self._export_progress_dialog.destroy()
+            except Exception:
+                pass
+
+            dlg = Gtk.Dialog(title=title, transient_for=self, flags=0)
+            dlg.set_default_size(420, 110)
+            content = dlg.get_content_area()
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin=10)
+            content.pack_start(box, True, True, 0)
+
+            lbl = Gtk.Label(label="Preparing export...", xalign=0)
+            box.pack_start(lbl, False, False, 0)
+
+            prog = Gtk.ProgressBar()
+            prog.set_show_text(True)
+            prog.set_fraction(0.0)
+            box.pack_start(prog, False, False, 0)
+
+            btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            cancel_btn = Gtk.Button(label="Cancel")
+            btn_box.pack_end(cancel_btn, False, False, 0)
+            box.pack_start(btn_box, False, False, 0)
+
+            def _on_cancel(bt):
+                with self._export_lock:
+                    self._export_cancel_requested = True
+                cancel_btn.set_sensitive(False)
+                lbl.set_text("Cancel requested — finishing current task...")
+
+            cancel_btn.connect("clicked", _on_cancel)
+
+            dlg.show_all()
+
+            self._export_progress_dialog = dlg
+            self._export_progress_bar = prog
+            self._export_progress_label = lbl
+            self._export_total_tasks = int(total) if total else 0
+            self._export_done_tasks = 0
+            with self._export_lock:
+                self._export_cancel_requested = False
+            return False
+
+        GLib.idle_add(_create)
+
+
+    def _update_export_progress(self, done: int, message: Optional[str] = None):
+        """
+        Update progress bar and label. safe to call from background threads.
+        """
+        def _upd():
+            if not self._export_progress_bar:
+                return False
+            try:
+                self._export_done_tasks = int(done)
+                total = float(self._export_total_tasks) if self._export_total_tasks else 1.0
+                frac = min(max(self._export_done_tasks / total, 0.0), 1.0)
+                self._export_progress_bar.set_fraction(frac)
+                text = f"{self._export_done_tasks}/{self._export_total_tasks}"
+                if message:
+                    self._export_progress_bar.set_text(f"{text} — {message}")
+                    self._export_progress_label.set_text(message)
+                else:
+                    self._export_progress_bar.set_text(text)
+            except Exception:
+                pass
+            return False
+
+        GLib.idle_add(_upd)
+
+
+    def _finish_export_progress(self):
+        """
+        Close progress dialog and reset flags.
+        """
+        def _finish():
+            try:
+                if self._export_progress_dialog:
+                    self._export_progress_dialog.destroy()
+            except Exception:
+                pass
+            self._export_progress_dialog = None
+            self._export_progress_bar = None
+            self._export_progress_label = None
+            self._export_total_tasks = 0
+            self._export_done_tasks = 0
+            with self._export_lock:
+                self._export_cancel_requested = False
+            return False
+
+        GLib.idle_add(_finish)
+
+    # ----------------------------------------------------------------------
+    # Settings dialog: central place for supersample, disk cache, install, and Mint-Y export options
+    # ----------------------------------------------------------------------
+    def on_settings_clicked(self, widget):
+        # Declare globals up-front. They must appear before any use in this function.
+        global SUPERSAMPLE_ENABLED, SUPERSAMPLE_FACTOR
+        global DISK_CACHE_ENABLED, DISK_CACHE_DIR, DISK_CACHE_SIZE_LIMIT
+        global MINTY_ENABLED, MINTY_EXPORT_PATH, MINTY_2X_ENABLED
+
+        dialog = Gtk.Dialog(title="Settings", transient_for=self, flags=0)
+        dialog.set_default_size(600, 400)
+        dialog.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, Gtk.STOCK_OK, Gtk.ResponseType.OK)
+
+        content = dialog.get_content_area()
+        notebook = Gtk.Notebook()
+        content.pack_start(notebook, True, True, 0)
+
+        # General tab (supersampling and disk cache)
+        gen_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin=10)
+        ss_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        supersample_check = Gtk.CheckButton(label="Enable supersampling")
+        supersample_check.set_active(bool(SUPERSAMPLE_ENABLED))
+        supersample_check.connect("toggled", lambda w: None)
+        ss_box.pack_start(supersample_check, False, False, 0)
+        adj = Gtk.Adjustment(value=SUPERSAMPLE_FACTOR, lower=2, upper=6, step_increment=1)
+        supersample_spin = Gtk.SpinButton(adjustment=adj, numeric=True)
+        supersample_spin.set_value(SUPERSAMPLE_FACTOR)
+        ss_box.pack_start(Gtk.Label(label="Factor:"), False, False, 0)
+        ss_box.pack_start(supersample_spin, False, False, 0)
+        gen_box.pack_start(ss_box, False, False, 0)
+
+        cache_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        disk_cache_check = Gtk.CheckButton(label="Use disk thumbnail cache")
+        disk_cache_check.set_active(bool(DISK_CACHE_ENABLED))
+        cache_box.pack_start(disk_cache_check, False, False, 0)
+        cache_size_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        cache_size_label = Gtk.Label(label="Disk cache limit (MB):")
+        # Use current global value here; global declared earlier in function
+        cache_size_adj = Gtk.Adjustment(value=DISK_CACHE_SIZE_LIMIT // (1024*1024), lower=10, upper=10240, step_increment=10)
+        cache_size_spin = Gtk.SpinButton(adjustment=cache_size_adj, numeric=True)
+        cache_size_box.pack_start(cache_size_label, False, False, 0)
+        cache_size_box.pack_start(cache_size_spin, False, False, 0)
+        cache_box.pack_start(cache_size_box, False, False, 0)
+        gen_box.pack_start(cache_box, False, False, 0)
+
+        notebook.append_page(gen_box, Gtk.Label(label="General"))
+
+        # Mint-Y Export tab
+        mint_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, margin=10)
+        mint_enable = Gtk.CheckButton(label="Use Mint-Y export style (master SVG with rects)")
+        mint_enable.set_active(bool(MINTY_ENABLED))
+        mint_box.pack_start(mint_enable, False, False, 0)
+
+        path_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        path_label = Gtk.Label(label="Export root folder:")
+        # Use a folder chooser button
+        chooser = Gtk.FileChooserButton(title="Select export root folder", action=Gtk.FileChooserAction.SELECT_FOLDER)
+        if MINTY_EXPORT_PATH:
+            try:
+                chooser.set_filename(MINTY_EXPORT_PATH)
+            except Exception:
+                pass
+        path_box.pack_start(path_label, False, False, 0)
+        path_box.pack_start(chooser, True, True, 0)
+        mint_box.pack_start(path_box, False, False, 0)
+
+        # 2x toggle
+        mint_2x = Gtk.CheckButton(label="Generate @2x HiDPI variants (e.g. 16@2x)")
+        mint_2x.set_active(bool(MINTY_2X_ENABLED))
+        mint_box.pack_start(mint_2x, False, False, 0)
+
+        # Example sizes info
+        sizes_label = Gtk.Label(label="Typical Mint-Y sizes produced: 16 22 24 256 32 48 64 96 and @2x variants", xalign=0)
+        mint_box.pack_start(sizes_label, False, False, 0)
+
+        # Install theme button (exposed here)
+        install_btn = Gtk.Button(label="Install Theme Now")
+        install_btn.connect("clicked", self.on_install_theme_clicked)
+        mint_box.pack_start(install_btn, False, False, 0)
+
+        notebook.append_page(mint_box, Gtk.Label(label="Mint-Y Export"))
+
+        dialog.show_all()
+        response = dialog.run()
+        if response == Gtk.ResponseType.OK:
+            # Apply general settings
+            # Note: these functions will call save_config()
+            self.on_supersample_toggled(supersample_check)
+            self.on_supersample_factor_changed(supersample_spin)
+            self.on_disk_cache_toggled(disk_cache_check)
+            try:
+                DISK_CACHE_SIZE_LIMIT = int(cache_size_spin.get_value_as_int()) * 1024 * 1024
+            except Exception:
+                pass
+
+            # Apply mint settings (globals declared at top of function)
+            MINTY_ENABLED = mint_enable.get_active()
+            chosen = chooser.get_filename()
+            MINTY_EXPORT_PATH = chosen or ""
+            MINTY_2X_ENABLED = mint_2x.get_active()
+            save_config()
+            # update label
+            self.export_mode_label.set_text(self._export_mode_text())
+            # ensure disk cache dir if enabled
+            if DISK_CACHE_ENABLED:
+                ensure_disk_cache_dir()
+        dialog.destroy()
 
     # ----------------------------------------------------------------------
     # Dialogs and Messaging
@@ -1065,7 +1353,7 @@ class IconThemeHelper(Gtk.Window):
         response = dialog.run()
         if response == Gtk.ResponseType.OK:
             self.theme_path = dialog.get_filename()
-            self.install_btn.set_sensitive(True)
+            self.install_btn = None
             close_all_previews()
             clear_pixbuf_cache()
             self.indexing_done = False
@@ -1090,7 +1378,7 @@ class IconThemeHelper(Gtk.Window):
                     elif ext.lower() == ".png":
                         parent_dir = os.path.basename(root)
                         try:
-                            size = int(parent_dir)
+                            size = int(parent_dir.split('@')[0])  # handle "@2x" suffix directories if present
                         except ValueError:
                             size = 0
                         icons_found[icon_name]['pngs'].append((size, full_path))
@@ -1162,7 +1450,7 @@ class IconThemeHelper(Gtk.Window):
         filtered = []
         for icon_name in icon_names:
             icon_path = self.icon_index.get(icon_name)
-            csf = self.current_status_filter
+            csf = getattr(self, "current_status_filter", "All Icons")
             if csf == "All Icons":
                 filtered.append(icon_name)
             elif csf == "Missing Icons":
@@ -1241,32 +1529,372 @@ class IconThemeHelper(Gtk.Window):
         return False
 
     # ----------------------------------------------------------------------
-    # Icon editing / bitmap generation
+    # Helpers for Mint-Y style parsing and rendering
+    # ----------------------------------------------------------------------
+    def _parse_master_svg(self, svg_path: str):
+        """
+        Parse an SVG similar to Mint-Y / Moka master files.
+
+        Two-pass approach:
+        1) SAX-based detection of a 'Baseplate' layer and rects inside it (fast/strict).
+        2) Fallback: ElementTree scan of the whole document for any <rect>-like element
+        and for id patterns containing sizes (robust).
+
+        Returns dict with keys: icon_name (str), context (str), rects (list of dicts {id,width,height})
+        or None if not detected.
+        """
+        import re
+        import xml.sax
+        from xml.etree import ElementTree as ET
+        class MasterHandler(xml.sax.ContentHandler):
+            ROOT = 0
+            SVG = 1
+            LAYER = 2
+            OTHER = 3
+            TEXT = 4
+
+            def __init__(self):
+                super().__init__()
+                self.stack = [self.ROOT]
+                self.inside = [self.ROOT]
+                self.rects = []
+                self.chars = ""
+                self.context = None
+                self.icon_name = None
+                self.text = None
+
+            def _looks_like_baseplate(self, attrs):
+                # Check any attribute value that contains 'baseplate' (case-insensitive)
+                for k in attrs.getNames():
+                    try:
+                        v = attrs.get(k)
+                        if v and 'baseplate' in v.strip().lower():
+                            return True
+                    except Exception:
+                        pass
+                # Also check for layer markers: inkscape:groupmode="layer" + label containing baseplate
+                try:
+                    gm = False
+                    label = None
+                    for k in attrs.getNames():
+                        kn = k.lower()
+                        if kn.endswith('groupmode') and attrs.get(k) and attrs.get(k).lower() == 'layer':
+                            gm = True
+                        if kn.endswith('label'):
+                            label = attrs.get(k)
+                    if gm and label and 'baseplate' in label.strip().lower():
+                        return True
+                except Exception:
+                    pass
+                return False
+
+            def _parse_int_like(self, s):
+                if not s:
+                    return None
+                s2 = re.sub(r'[^\d\.]', '', s)
+                if not s2:
+                    return None
+                try:
+                    return int(float(s2))
+                except Exception:
+                    return None
+
+            def startElement(self, name, attrs):
+                if self.inside[-1] == self.ROOT:
+                    if name == "svg":
+                        self.stack.append(self.SVG)
+                        self.inside.append(self.SVG)
+                        return
+                elif self.inside[-1] == self.SVG:
+                    if self._looks_like_baseplate(attrs):
+                        self.stack.append(self.LAYER)
+                        self.inside.append(self.LAYER)
+                        self.rects = []
+                        self.context = None
+                        self.icon_name = None
+                        return
+                elif self.inside[-1] == self.LAYER:
+                    for k in attrs.getNames():
+                        try:
+                            if attrs.get(k) and attrs.get(k).strip().lower() == 'context':
+                                self.stack.append(self.TEXT)
+                                self.inside.append(self.TEXT)
+                                self.text = 'context'
+                                self.chars = ""
+                                return
+                            if attrs.get(k) and attrs.get(k).strip().lower() == 'icon-name':
+                                self.stack.append(self.TEXT)
+                                self.inside.append(self.TEXT)
+                                self.text = 'icon-name'
+                                self.chars = ""
+                                return
+                        except Exception:
+                            pass
+                    if name == "rect":
+                        rect_id = attrs.get("id", None)
+                        width = attrs.get("width", None)
+                        height = attrs.get("height", None)
+                        w = self._parse_int_like(width) if width is not None else None
+                        h = self._parse_int_like(height) if height is not None else None
+
+                        # infer from id using common patterns (rect16x16, rect_48, 16@2x, 96, etc.)
+                        if (not w or w == 0) and rect_id:
+                            m = re.search(r'(\d{1,4})\s*[x×]\s*(\d{1,4})', rect_id)
+                            if m:
+                                try:
+                                    w = int(m.group(1)); h = int(m.group(2))
+                                except Exception:
+                                    pass
+                            if not w:
+                                m2 = re.search(r'(\d{2,4})(?:@(\d)x)?', rect_id)
+                                if m2:
+                                    try:
+                                        w = int(m2.group(1))
+                                    except Exception:
+                                        pass
+                            if not w:
+                                m3 = re.search(r'[_\-\s](\d{2,4})(?:@(\d)x)?', rect_id)
+                                if m3:
+                                    try:
+                                        w = int(m3.group(1))
+                                    except Exception:
+                                        pass
+                        if rect_id and w and w > 0:
+                            self.rects.append({"id": rect_id, "width": w, "height": h or w})
+                            return
+                self.stack.append(self.OTHER)
+
+            def endElement(self, name):
+                if not self.stack:
+                    return
+                stacked = self.stack.pop()
+                if self.inside and self.inside[-1] == stacked:
+                    self.inside.pop()
+                if stacked == self.TEXT and self.text is not None:
+                    if self.text == 'context':
+                        self.context = (self.chars or "").strip()
+                    elif self.text == 'icon-name':
+                        self.icon_name = (self.chars or "").strip()
+                    self.text = None
+
+            def characters(self, content):
+                if getattr(self, 'text', None):
+                    self.chars += content
+
+        handler = MasterHandler()
+        try:
+            xml.sax.parse(svg_path, handler)
+        except Exception:
+            # ignore SAX parse errors and continue to fallback
+            pass
+
+        rects = handler.rects[:]
+        icon_name = handler.icon_name
+        context = handler.context or "apps"
+
+        # If SAX didn't find multiple rects (common in some variants), do a robust fallback:
+        if len(rects) < 2:
+            try:
+                tree = ET.parse(svg_path)
+                root = tree.getroot()
+                # namespace-insensitive iteration: tag may be '{...}rect'
+                found = {}
+                for elem in root.iter():
+                    tag = elem.tag
+                    if isinstance(tag, str) and tag.lower().endswith('rect'):
+                        rid = elem.get('id') or elem.get('{http://www.w3.org/XML/1998/namespace}id')
+                        w = None
+                        h = None
+                        # try width/height attributes
+                        ww = elem.get('width') or elem.get('{http://www.w3.org/1999/xlink}width')
+                        hh = elem.get('height') or elem.get('{http://www.w3.org/1999/xlink}height')
+                        if ww:
+                            try:
+                                w = int(float(re.sub(r'[^\d\.]', '', ww)))
+                            except Exception:
+                                w = None
+                        if hh:
+                            try:
+                                h = int(float(re.sub(r'[^\d\.]', '', hh)))
+                            except Exception:
+                                h = None
+                        # infer from id if needed
+                        if (not w or w == 0) and rid:
+                            m = re.search(r'(\d{1,4})\s*[x×]\s*(\d{1,4})', rid)
+                            if m:
+                                try:
+                                    w = int(m.group(1)); h = int(m.group(2))
+                                except Exception:
+                                    pass
+                            if not w:
+                                m2 = re.search(r'(\d{2,4})(?:@(\d)x)?', rid)
+                                if m2:
+                                    try:
+                                        w = int(m2.group(1))
+                                    except Exception:
+                                        pass
+                            if not w:
+                                m3 = re.search(r'[_\-\s](\d{2,4})(?:@(\d)x)?', rid)
+                                if m3:
+                                    try:
+                                        w = int(m3.group(1))
+                                    except Exception:
+                                        pass
+                        if rid and w and w > 0:
+                            found[rid] = {"id": rid, "width": w, "height": h or w}
+                # Merge unique found rects into rects list, preserving any SAX results first
+                for r in found.values():
+                    if not any(existing['id'] == r['id'] for existing in rects):
+                        rects.append(r)
+                # Try also scanning for <g> or other elements with ids that encode sizes (some templates place markers as groups)
+                if len(rects) < 2:
+                    for elem in root.iter():
+                        rid = elem.get('id')
+                        if not rid:
+                            continue
+                        m = re.search(r'(\d{2,4})(?:@(\d)x)?', rid)
+                        if m:
+                            try:
+                                w = int(m.group(1))
+                                if not any(existing['id'] == rid for existing in rects):
+                                    rects.append({"id": rid, "width": w, "height": w})
+                            except Exception:
+                                pass
+                # try to extract icon-name if missing: look for elements with text in a label attribute
+                if not icon_name:
+                    # look for <text> elements whose parent's attributes include 'icon-name' or similar
+                    for elem in root.iter():
+                        tag = elem.tag
+                        if isinstance(tag, str) and tag.lower().endswith('text'):
+                            # element text
+                            txt = (elem.text or "").strip()
+                            if txt and len(txt) > 0 and 'icon' in txt.lower():
+                                # crude heuristics: skip, prefer label attribute searching instead
+                                pass
+                    # also search for any attribute value that equals an icon name (rare)
+            except Exception:
+                pass
+
+        # final sanity: need an icon_name and at least one rect to consider a valid master
+        if not icon_name:
+            # try to infer icon_name from filename
+            icon_name = os.path.splitext(os.path.basename(svg_path))[0]
+
+        if rects:
+            return {"icon_name": icon_name, "context": context, "rects": rects}
+        return None
+
+    def _inkscape_render_rect(self, svg_file, rect_id, dpi, output_file):
+        """
+        Render an individual rect (by id) from svg_file with inkscape.
+        Try multiple CLI variants and capture stdout/stderr for diagnostics.
+        Returns True on success, False on failure.
+        """
+        # detect inkscape binary and flatpak presence
+        inkscape_bin = shutil.which("inkscape") or "inkscape"
+        flatpak_bin = shutil.which("flatpak")
+
+        cmds = []
+
+        # If flatpak is available, try calling Inkscape via flatpak run org.inkscape.Inkscape
+        if flatpak_bin:
+            # Try a couple of flatpak wrapped variants
+            cmds.append([flatpak_bin, "run", "org.inkscape.Inkscape", "--batch-process", "--export-dpi", str(dpi), "-i", rect_id, "-o", output_file, svg_file])
+            cmds.append([flatpak_bin, "run", "org.inkscape.Inkscape", svg_file, f"--export-filename={output_file}", f"--export-dpi={dpi}", f"--export-id={rect_id}", "--export-id-only"])
+            cmds.append([flatpak_bin, "run", "org.inkscape.Inkscape", "--export-id", rect_id, f"--export-filename={output_file}", f"--export-dpi={dpi}", svg_file])
+
+        # native inkscape variants
+        cmds.append([inkscape_bin, "--batch-process", "--export-dpi", str(dpi), "-i", rect_id, "-o", output_file, svg_file])
+        cmds.append([inkscape_bin, svg_file, f"--export-filename={output_file}", f"--export-dpi={dpi}", f"--export-id={rect_id}", "--export-id-only"])
+        cmds.append([inkscape_bin, "--export-id", rect_id, f"--export-filename={output_file}", f"--export-dpi={dpi}", svg_file])
+
+        for cmd in cmds:
+            try:
+                proc = subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=120)
+                return True
+            except subprocess.CalledProcessError as e:
+                print(f"Inkscape export failed (exit {e.returncode}): {' '.join(cmd)}")
+                if e.stdout:
+                    print("stdout:", e.stdout)
+                if e.stderr:
+                    print("stderr:", e.stderr)
+                # try next variant
+            except FileNotFoundError:
+                print(f"Inkscape binary not found (tried {' '.join(cmd)}).")
+                # try next variant
+            except subprocess.TimeoutExpired:
+                print(f"Inkscape export timed out: {' '.join(cmd)}")
+            except Exception as e:
+                print(f"Inkscape export error for {' '.join(cmd)}: {e}")
+
+        print(f"All Inkscape export attempts failed for id={rect_id} svg={svg_file} -> {output_file}")
+        return False
+
+    def _resolve_export_root(self):
+        """
+        Resolve the effective export root for Mint-Y style exports.
+        If MINTY_EXPORT_PATH is set and absolute, use it. If it's set and relative,
+        resolve it against the currently selected theme_path. Otherwise fall back to theme_path.
+        """
+        if MINTY_EXPORT_PATH:
+            if os.path.isabs(MINTY_EXPORT_PATH):
+                return MINTY_EXPORT_PATH
+            elif self.theme_path:
+                return os.path.join(self.theme_path, MINTY_EXPORT_PATH)
+            else:
+                return MINTY_EXPORT_PATH
+        return self.theme_path
+
+    # ----------------------------------------------------------------------
+    # Icon editing / bitmap generation (Mint-Y support included)
     # ----------------------------------------------------------------------
     def on_icon_clicked(self, icon_path: str, icon_name: str):
+        """
+        Open the SVG for editing. Prefer the SVG path shown in the grid (icon_path)
+        when it is an actual SVG file. Otherwise create/copy a new SVG into the
+        theme (category/96) from TEMPLATE_SVG and open that.
+        """
         if not self.theme_path or not self.current_category:
             self.show_message("Error", "Theme or category not selected")
             return
-        base_dir = os.path.join(self.theme_path, self.current_category, "96")
-        if not os.path.isdir(base_dir):
-            base_dir = os.path.join(self.theme_path, "fallback", "96")
-        os.makedirs(base_dir, exist_ok=True)
-        new_icon_path = os.path.join(base_dir, icon_name + ".svg")
-        if not os.path.exists(new_icon_path):
-            if not check_file_exists(TEMPLATE_SVG):
-                self.show_message("Error", f"Missing SVG template: {TEMPLATE_SVG}")
-                return
-            try:
-                shutil.copy2(TEMPLATE_SVG, new_icon_path)
-            except Exception as e:
-                self.show_message("Error", f"Failed to copy template: {e}")
-                return
+
+        # Prefer to edit the actual SVG shown in the grid if it exists.
+        svg_to_edit = None
         try:
-            subprocess.Popen(["inkscape", new_icon_path])
+            if icon_path and os.path.isfile(icon_path) and icon_path.lower().endswith(".svg"):
+                # Don't open the placeholder or template as the "existing" source.
+                if os.path.abspath(icon_path) != os.path.abspath(PLACEHOLDER_PATH) and os.path.abspath(icon_path) != os.path.abspath(TEMPLATE_SVG):
+                    svg_to_edit = icon_path
+        except Exception:
+            svg_to_edit = None
+
+        # If no existing svg found (or it's a placeholder), create/use one inside the theme (96)
+        if not svg_to_edit:
+            base_dir = os.path.join(self.theme_path, self.current_category, "96")
+            if not os.path.isdir(base_dir):
+                base_dir = os.path.join(self.theme_path, "fallback", "96")
+            os.makedirs(base_dir, exist_ok=True)
+            new_icon_path = os.path.join(base_dir, icon_name + ".svg")
+            if not os.path.exists(new_icon_path):
+                if not check_file_exists(TEMPLATE_SVG):
+                    self.show_message("Error", f"Missing SVG template: {TEMPLATE_SVG}")
+                    return
+                try:
+                    shutil.copy2(TEMPLATE_SVG, new_icon_path)
+                except Exception as e:
+                    self.show_message("Error", f"Failed to copy template: {e}")
+                    return
+            svg_to_edit = new_icon_path
+
+        # Launch editor on the chosen svg and start watching it for changes
+        try:
+            subprocess.Popen(["inkscape", svg_to_edit])
         except Exception as e:
             self.show_message("Error", f"Failed to launch Inkscape: {e}")
             return
-        threading.Thread(target=self.watch_and_generate, args=(new_icon_path,), daemon=True).start()
+
+        # Watch the exact file opened so we regenerate bitmaps for the correct source
+        threading.Thread(target=self.watch_and_generate, args=(svg_to_edit,), daemon=True).start()
 
     def watch_and_generate(self, svg_path: str):
         try:
@@ -1286,12 +1914,128 @@ class IconThemeHelper(Gtk.Window):
                     self.backup_svg(svg_path)
                 except Exception:
                     pass
+                # debounce briefly to allow multiple quick writes to settle
+                time.sleep(0.5)
                 self.generate_bitmaps(svg_path)
                 GLib.idle_add(self.refresh_icon, os.path.basename(svg_path))
                 break
 
     def generate_bitmaps(self, svg_path: str):
+        """
+        If the SVG resembles a Mint-Y master (has Baseplate with rects), export using rect ids
+        into size folders (and optionally @2x). Otherwise fall back to per-size generation (Mint-X style).
+
+        This version filters/matches the discovered rect widths to a known set of standard icon sizes
+        (to avoid creating folders like 88, 220, etc). If a rect width is close to a standard size
+        (within a tolerance) it is snapped to that size; otherwise it is ignored.
+        """
         base_name = os.path.splitext(os.path.basename(svg_path))[0]
+        # Detect master layout
+        try:
+            master = self._parse_master_svg(svg_path)
+        except Exception:
+            master = None
+
+        # Standard sizes Mint-Y typically produces
+        STANDARD_SIZES = [16, 22, 24, 32, 48, 64, 96, 256]
+        TOLERANCE = 0.15  # relative tolerance to snap non-standard widths to a standard size (15%)
+
+        def snap_to_standard(w: int) -> Optional[int]:
+            if not w:
+                return None
+            if w in STANDARD_SIZES:
+                return w
+            # find closest
+            best = None
+            best_diff = None
+            for s in STANDARD_SIZES:
+                diff = abs(s - w) / float(s)
+                if best is None or diff < best_diff:
+                    best = s
+                    best_diff = diff
+            if best is not None and best_diff is not None and best_diff <= TOLERANCE:
+                return best
+            return None
+
+        if master and MINTY_ENABLED:
+            try:
+                icon_name = master.get("icon_name", base_name)
+                context = master.get("context", self.current_category or "apps")
+                export_root = self._resolve_export_root() or self.theme_path
+                dpi_factors = [1] + ([2] if MINTY_2X_ENABLED else [])
+
+                # Build mapping snapped to standard sizes (same logic you already have)
+                rects = master.get("rects", [])
+                mapped: Dict[int, str] = {}
+                for rect in rects:
+                    rid = rect.get("id")
+                    width = rect.get("width") or rect.get("height") or 0
+                    snapped = snap_to_standard(width)  # your existing snap function
+                    if snapped and snapped not in mapped:
+                        mapped[snapped] = rid
+
+                # prepare tasks count
+                total_tasks = len(mapped) * len(dpi_factors)
+                # start progress UI
+                self._start_export_progress(total_tasks, title=f"Exporting {icon_name} icons")
+
+                done = 0
+                try:
+                    for size, rid in sorted(mapped.items()):
+                        for factor in dpi_factors:
+                            # allow cancelation check before starting next task
+                            with self._export_lock:
+                                if self._export_cancel_requested:
+                                    raise KeyboardInterrupt("Export cancelled by user")
+                            dpi = DPI_1_TO_1 * factor
+                            size_str = f"{size}" if factor == 1 else f"{size}@{factor}x"
+                            out_dir = os.path.join(export_root, context, size_str)
+                            os.makedirs(out_dir, exist_ok=True)
+                            outfile = os.path.join(out_dir, icon_name + ".png")
+
+                            needs = False
+                            if not os.path.exists(outfile):
+                                needs = True
+                            else:
+                                stat_in = os.stat(svg_path)
+                                stat_out = os.stat(outfile)
+                                if stat_in.st_mtime > stat_out.st_mtime:
+                                    needs = True
+
+                            if needs:
+                                ok = self._inkscape_render_rect(svg_path, rid, dpi, outfile)
+                                # optionally log ok/fail
+                            # one task completed regardless of success
+                            done += 1
+                            self._update_export_progress(done, f"{size_str} -> {os.path.basename(outfile)}")
+                    # finished normally
+                except KeyboardInterrupt:
+                    # user cancelled — fall through to cleanup
+                    pass
+                finally:
+                    # ensure caches refreshed
+                    try:
+                        for size in mapped.keys():
+                            # touch invalidation for each output size variant
+                            for factor in dpi_factors:
+                                size_str = f"{size}" if factor == 1 else f"{size}@{factor}x"
+                                out_dir = os.path.join(export_root, context, size_str)
+                                outfile = os.path.join(out_dir, icon_name + ".png")
+                                invalidate_pixbuf_cache_for_path(outfile)
+                    except Exception:
+                        pass
+                    # finish UI
+                    self._finish_export_progress()
+
+                # update index and UI
+                self.icon_index[base_name] = svg_path
+                if self.current_category:
+                    GLib.idle_add(self.load_icons, self.current_category)
+            except Exception as e:
+                print(f"Master export failed for {svg_path}: {e}")
+            return
+
+        # Fallback: Mint-X style -> generate per BITMAP_SIZES
         category = next((cat for cat, icons in self.icon_categories.items() if base_name in icons), "fallback")
         for size in BITMAP_SIZES:
             out_dir = os.path.join(self.theme_path, category, str(size))
@@ -1312,12 +2056,12 @@ class IconThemeHelper(Gtk.Window):
                         with Image.open(tmp_file) as im:
                             im = im.resize((size, size), Image.LANCZOS)
                             # write to temp then move atomically
-                            tmp_out = out_png + ".tmp"
+                            tmp_out = out_png + ".tmp.png"
                             im.save(tmp_out)
                             os.replace(tmp_out, out_png)
                     except Exception:
                         try:
-                            tmp_out = out_png + ".tmp"
+                            tmp_out = out_png + ".tmp.png"
                             subprocess.run(["convert", tmp_file, "-filter", "Lanczos", "-resize", f"{size}x{size}", tmp_out], check=True)
                             os.replace(tmp_out, out_png)
                         except Exception:
@@ -1335,7 +2079,7 @@ class IconThemeHelper(Gtk.Window):
                         except Exception:
                             pass
             else:
-                tmp_out = out_png + ".tmp"
+                tmp_out = out_png + ".tmp.png"
                 cmd = ["inkscape", svg_path, f"--export-filename={tmp_out}", f"--export-width={size}", f"--export-height={size}"]
                 try:
                     subprocess.run(cmd, check=True)
