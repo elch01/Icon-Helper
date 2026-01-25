@@ -186,7 +186,3 @@ If you'd like any of the above added, tell me which and I’ll extend the script
 ## License
 
 GPL v3.0
-
----
-
-If you want, I can also generate a short manpage, quick reference card, or example CI job (GitHub Actions) that runs the migration and validates outputs.
