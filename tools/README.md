@@ -169,20 +169,6 @@ Limit file extensions when scanning directories (comma separated):
 - Naming & structure
   - When processing a directory, the script preserves relative paths and writes the migrated SVG at the same relative path under the output directory.
 
----
-
-## Advanced ideas (can be added)
-
-- Save pruned elements to a per-icon "archive" SVG instead of deleting them.
-- Produce a CSV/JSON report listing pruned element ids and bboxes.
-- Auto-assign temporary ids to elements without ids before pruning (risky).
-- Parallelize directory processing for speed.
-- Add a `--verbose` flag to dump more internal diagnostics.
-
-If you'd like any of the above added, tell me which and I’ll extend the script.
-
----
-
 ## License
 
 GPL v3.0
