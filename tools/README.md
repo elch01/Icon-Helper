@@ -185,7 +185,7 @@ If you'd like any of the above added, tell me which and I’ll extend the script
 
 ## License
 
-MIT License — use and modify freely. (Include your own project license if preferred.)
+GPL v3.0
 
 ---
 
